@@ -89,9 +89,7 @@ sentiment-trader/
 * [numpy](https://pypi.org/project/numpy/)
 * [transformers](https://pypi.org/project/transformers/) & [torch](https://pypi.org/project/torch/) *(optional)*
 
-## License
 
-MIT © Your Name
 
 ```
 ```
