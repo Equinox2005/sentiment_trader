@@ -1,0 +1,10 @@
+requests
+PySimpleGUI
+praw
+yfinance
+python-dotenv
+pandas
+numpy
+nltk
+transformers
+torch
