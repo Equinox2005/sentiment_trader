@@ -5,7 +5,7 @@ Live and historical sentiment-driven trading signals from Reddit comments.
 
 ## Features
 
-- **Backfill**: Fetches the most recent 24 hours of comments from your chosen subreddits.
+- **Backfill**: Fetches the most recent comments from your chosen subreddits.
 - **Real-time stream**: Continues listening for new comments as they appear.
 - **Keyword tracking**: Monitors comments matching your custom keywords (e.g. “Tesla”, “NVIDIA”).
 - **Sentiment analysis**: Base sentiment from VADER (or your choice) plus tweaks for “bearish”, “bullish”, “red”, “green”.
