@@ -19,8 +19,8 @@ Live and historical sentiment-driven trading signals from Reddit comments.
 1. **Clone the repo**
 
    ```bash
-   git clone https://github.com/YourUserName/sentiment-trader.git
-   cd sentiment-trader
+   git clone https://github.com/Equinox2005/sentiment_trader.git
+   cd sentiment_trader
 ````
 
 2. **Create & activate a virtual environment**
