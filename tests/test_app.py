@@ -38,9 +38,21 @@ class StubService:
         }
 
 
+class StubBoard:
+    def latest(self, limit=25):
+        return {
+            "available": True,
+            "run": {"session_date": "2025-06-10"},
+            "opportunities": [{"symbol": "AAA"}][:limit],
+        }
+
+    def history(self):
+        return {"runs": [{"id": 1, "status": "completed"}]}
+
+
 class AppTests(unittest.TestCase):
     def setUp(self):
-        app = create_app(StubService())
+        app = create_app(StubService(), board_service=StubBoard())
         app.config.update(TESTING=True)
         self.client = app.test_client()
 
@@ -105,6 +117,24 @@ class AppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Playbook", response.data)
         self.assertIn(b"receipts", response.data)
+
+    def test_opportunity_board_page_and_read_only_apis(self):
+        page = self.client.get("/opportunities")
+        latest = self.client.get("/api/opportunities/latest?limit=10")
+        history = self.client.get("/api/opportunities/history")
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b"largest", page.data)
+        self.assertEqual(latest.status_code, 200)
+        self.assertEqual(latest.get_json()["opportunities"][0]["symbol"], "AAA")
+        self.assertEqual(latest.headers["Cache-Control"], "no-store")
+        self.assertEqual(history.get_json()["runs"][0]["status"], "completed")
+
+    def test_opportunity_limit_is_validated(self):
+        response = self.client.get("/api/opportunities/latest?limit=nope")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["code"], "invalid_limit")
 
     def test_shareable_forecast_and_audit_pages_embed_route_state(self):
         forecast = self.client.get("/forecast/nvda")

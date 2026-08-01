@@ -16,6 +16,7 @@ It does not hide uncertainty behind a single indicator or an unexplained confide
 - 5-session, 10-session, and primary-horizon distributions;
 - empirically measured split-conformal interval coverage;
 - hindsight-sealed Time Machine replays and an immutable live forecast ledger;
+- a nightly S&P 500 opportunity board that ranks only positively audited bullish setups;
 - any small adjustment made by current headlines.
 
 ## What the fingerprint contains
@@ -102,13 +103,44 @@ Quick forecasts also persist a short-lived, opaque source-snapshot token. The au
 
 The same SQLite database holds the live forecast ledger. Forecast inserts are immutable per symbol/session/horizon, unfinished daily candles are never recorded or graded, and refreshed split/dividend adjustments are applied consistently to both grading endpoints.
 
+### After-close S&P 500 scanner
+
+Playbook can run the complete audited engine across the current S&P 500 and publish the largest credible predicted increases:
+
+```powershell
+python scan_sp500.py --once
+```
+
+Run it after **5:15 PM America/New_York**. The scanner verifies the latest SPY session before it creates a batch, fetches the current Wikipedia constituent table, normalizes provider symbols such as `BRK.B` to `BRK-B`, and caches a last-known-good universe. A live universe that parses fewer than 450 constituents is rejected rather than silently accepted.
+
+For a dedicated always-running scheduler process:
+
+```powershell
+python scan_sp500.py --schedule
+```
+
+This is intentionally separate from Flask/Waitress so multiple web workers cannot start duplicate jobs. The machine and scheduler process must remain running. For unattended operation, Windows Task Scheduler can run `python scan_sp500.py --once` on weekdays after 5:15 PM ET; weekend/holiday retries safely resolve to the latest confirmed market session.
+
+Each `(market session, algorithm version)` batch is immutable. SQLite stores the exact universe snapshot, per-symbol state, raw ranking factors, failures, runtime, and a bounded cross-process lease. If the process is interrupted, rerunning the command after the lease expires resumes unfinished symbols without recomputing completed ones. A second process cannot acquire an active lease.
+
+The default board admits only setups with all of these properties:
+
+- a **positive** untouched walk-forward audit—not mixed, limited, or weak;
+- a bullish analog direction that current news has not cancelled;
+- at least a four-point analog probability edge and positive median return;
+- evidence score of at least 50 and non-conflicting agreement.
+
+The transparent opportunity score rewards projected median increase, analog edge, independent evidence, agreement, and Brier skill. It subtracts points for the adjusted downside estimate and interval width. News cannot create eligibility because the underlying analog direction must already be bullish.
+
+With three concurrent workers and a warm price cache, a full 503-constituent scan is expected to take roughly 20–60 minutes depending on provider latency and CPU. Use `PLAYBOOK_SCAN_WORKERS` (maximum 8), `PLAYBOOK_SCAN_TIME`, and `PLAYBOOK_DATA_CACHE` to configure operation. Individual provider failures produce an explicit partial board rather than aborting the batch.
+
 ## Test
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-The 71-test suite covers vectorized shape equivalence, batch/single matching equivalence, persistent refresh and split drift, cross-worker snapshot coherence, immutable forecast grading, completed-session boundaries, dense leak-free audit records, separated conformal calibration, multi-horizon distributions, waterfall arithmetic, Time Machine routes, corrected RSI edge cases, independent episode spacing, bounded news adjustment, intraday path outcomes, global session-date alignment, crypto calendars, base-rate shrinkage, API errors, and sentiment behavior. On the development machine, deterministic 20-year pure compute takes roughly 0.05 seconds for the preliminary forecast and 5 seconds for the complete 260-record audit.
+The 84-test suite covers vectorized shape equivalence, batch/single matching equivalence, persistent refresh and split drift, cross-worker snapshot coherence, immutable forecast grading, completed-session boundaries, dense leak-free audit records, separated conformal calibration, multi-horizon distributions, waterfall arithmetic, Time Machine routes, corrected RSI edge cases, independent episode spacing, bounded news adjustment, intraday path outcomes, global session-date alignment, crypto calendars, base-rate shrinkage, API errors, sentiment behavior, S&P universe validation/fallback, after-close gating, exact-session batch alignment, opportunity eligibility/ranking, claim-owner-safe resumable leases, immutable scans, partial failures, and board APIs. On the development machine, deterministic 20-year pure compute takes roughly 0.05 seconds for the preliminary forecast and 5 seconds for the complete 260-record audit.
 
 ## API
 
@@ -120,12 +152,15 @@ GET /api/analyze/NVDA/audit?snapshot=<quick-response-token>
 GET /api/analyze/NVDA/as-of?date=2024-01-15
 GET /api/track-record/NVDA
 GET /api/analyze/BTC-USD?refresh=1
+GET /api/opportunities/latest
+GET /api/opportunities/history
 
 GET /forecast/NVDA
 GET /audit/NVDA
+GET /opportunities
 ```
 
-The original endpoint remains backward compatible. The browser requests `/quick` first so the fingerprint, twins, projection, and preliminary forecast paint immediately, then passes its snapshot token to `/audit` for adaptive weight selection, separate interval calibration, and untouched evaluation on the exact same source data. A real progress bar reflects those stages. `/forecast/<symbol>` and `/audit/<symbol>` are durable shareable product routes. Responses remain cached in memory for five minutes. Use `?refresh=1` on the original or quick endpoint to create a fresh price snapshot; snapshot-bound audit requests intentionally reject refresh.
+The original endpoint remains backward compatible. The browser requests `/quick` first so the fingerprint, twins, projection, and preliminary forecast paint immediately, then passes its snapshot token to `/audit` for adaptive weight selection, separate interval calibration, and untouched evaluation on the exact same source data. A real progress bar reflects those stages. `/forecast/<symbol>` and `/audit/<symbol>` are durable shareable product routes. `/opportunities` displays the latest completed scan while a newer run progresses, and its read-only APIs use `no-store`; scanner triggering remains CLI-only to prevent public abuse. Forecast responses remain cached in memory for five minutes. Use `?refresh=1` on the original or quick endpoint to create a fresh price snapshot; snapshot-bound audit requests intentionally reject refresh.
 
 ## Docker
 
