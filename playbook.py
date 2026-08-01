@@ -6,6 +6,7 @@ matching pipeline before presenting a forecast.
 """
 
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import numpy as np
@@ -23,6 +24,8 @@ GHOST_PATHS = 12
 MAX_HISTORY_DAYS = 366 * 20
 PRIOR_STRENGTH = 6.0
 MAX_NEWS_ADJUSTMENT = 5.0
+EVALUATION_STEP = 5
+MAX_EVALUATION_RECORDS = 260
 
 
 FEATURE_LABELS = {
@@ -92,12 +95,25 @@ WEIGHT_PROFILES = {
 }
 
 
+@dataclass(frozen=True)
+class PreparedMatrices:
+    feature_names: tuple
+    feature_columns: dict
+    feature_values: np.ndarray
+    shapes: np.ndarray
+    close: np.ndarray
+    high: np.ndarray
+    low: np.ndarray
+    dates: np.ndarray
+
+
 def build_playbook(
     history,
     context=None,
     news_score=0.0,
     news_count=0,
     earnings_at=None,
+    include_validation=True,
 ):
     """Build a historical analog forecast from OHLCV market history."""
     frame = _normalize_history(history)
@@ -113,6 +129,7 @@ def build_playbook(
 
     features = _compute_features(frame, context, config)
     shapes = _compute_shapes(frame["Close"], config["shape_days"])
+    prepared = _prepare_matrices(frame, features, shapes)
     today_position = len(frame) - 1
     current_features = features.iloc[today_position]
     if current_features.dropna().shape[0] < 8:
@@ -121,9 +138,22 @@ def build_playbook(
             "reason": "Today's setup could not be measured reliably from the available data.",
         }
 
-    profile_key, profile_selection = _select_weight_profile(
-        frame, features, shapes, config
-    )
+    if include_validation:
+        (
+            profile_key,
+            profile_selection,
+            calibration_predictions,
+        ) = _select_weight_profile(
+            frame, features, shapes, config, prepared
+        )
+    else:
+        profile_key = "balanced"
+        profile_selection = {
+            "tuning_forecasts": 0,
+            "profiles_tested": 0,
+            "reason": "Preliminary forecast; adaptive audit is loading.",
+        }
+        calibration_predictions = []
     matches = _rank_matches(
         frame,
         features,
@@ -132,6 +162,7 @@ def build_playbook(
         profile_key,
         include_paths=True,
         config=config,
+        prepared=prepared,
     )
     if len(matches) < MIN_MATCHES:
         return {
@@ -142,13 +173,24 @@ def build_playbook(
             ),
         }
 
-    validation = _walk_forward_validation(
-        frame,
-        features,
-        shapes,
-        profile_key,
-        profile_selection,
-        config,
+    validation = (
+        _walk_forward_validation(
+            frame,
+            features,
+            shapes,
+            profile_key,
+            profile_selection,
+            config,
+            prepared,
+            calibration_predictions,
+        )
+        if include_validation
+        else {
+            "available": False,
+            "pending": True,
+            "reason": "Walk-forward audit is loading.",
+            "selection": profile_selection,
+        }
     )
     summary = _summarize_matches(matches)
     forecast = _build_forecast(
@@ -167,6 +209,7 @@ def build_playbook(
 
     return {
         "available": True,
+        "preliminary": not include_validation,
         "setup": _describe_setup(current_features, regime),
         "fingerprint": _build_fingerprint(current_features, regime, features),
         "matching": {
@@ -184,8 +227,12 @@ def build_playbook(
                 0.5,
             )),
             "explanation": (
-                "Weights were selected on older walk-forward forecasts. "
-                "The latest validation period was kept untouched."
+                (
+                    "Weights were selected on older walk-forward forecasts. "
+                    "The latest validation period was kept untouched."
+                )
+                if include_validation
+                else "Balanced preliminary weights are shown while the adaptive audit loads."
             ),
         },
         "forecast": forecast,
@@ -193,7 +240,11 @@ def build_playbook(
         "stats": summary["public"],
         "validation": validation,
         "trade_plan": plan,
-        "projection": _projection(matches, config),
+        "projection": _projection(
+            matches,
+            config,
+            validation.get("conformal", {}).get("adjustment_points", 0.0),
+        ),
         "ghost_paths": [
             {
                 "date": _date_string(match["date"]),
@@ -418,31 +469,84 @@ def _align_context(context, target_index):
 def _compute_shapes(close, shape_days=SHAPE_DAYS):
     values = close.to_numpy(dtype=float)
     shapes = np.full((len(values), shape_days + 1), np.nan, dtype=float)
-    for end in range(shape_days, len(values)):
-        path = np.log(values[end - shape_days : end + 1] / values[end - shape_days])
-        spread = float(np.std(path))
-        if not np.isfinite(spread) or spread < 1e-9:
-            shapes[end] = np.zeros(shape_days + 1)
-        else:
-            shapes[end] = (path - float(np.mean(path))) / spread
+    if len(values) <= shape_days:
+        return shapes
+    windows = np.lib.stride_tricks.sliding_window_view(
+        values, shape_days + 1
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        paths = np.log(windows / windows[:, :1])
+    means = np.nanmean(paths, axis=1, keepdims=True)
+    spreads = np.nanstd(paths, axis=1, keepdims=True)
+    valid = (
+        np.isfinite(paths).all(axis=1)
+        & np.isfinite(spreads[:, 0])
+        & (spreads[:, 0] >= 1e-9)
+    )
+    normalized = np.zeros_like(paths, dtype=np.float64)
+    np.divide(
+        paths - means,
+        spreads,
+        out=normalized,
+        where=valid[:, None],
+    )
+    normalized[~np.isfinite(paths).all(axis=1)] = np.nan
+    shapes[shape_days:] = normalized
     return shapes
 
 
-def _select_weight_profile(frame, features, shapes, config):
-    anchors = _validation_anchors(len(frame), config)
-    if len(anchors) < 10:
-        return "balanced", {
-            "tuning_forecasts": len(anchors),
-            "profiles_tested": 1,
-            "reason": "Not enough older checkpoints to tune weights safely.",
-        }
+def _prepare_matrices(frame, features, shapes):
+    names = tuple(features.columns)
+    return PreparedMatrices(
+        feature_names=names,
+        feature_columns={name: index for index, name in enumerate(names)},
+        feature_values=np.ascontiguousarray(
+            features.to_numpy(dtype=np.float64), dtype=np.float64
+        ),
+        shapes=np.ascontiguousarray(shapes, dtype=np.float64),
+        close=np.ascontiguousarray(
+            frame["Close"].to_numpy(dtype=np.float64)
+        ),
+        high=np.ascontiguousarray(
+            frame["High"].to_numpy(dtype=np.float64)
+        ),
+        low=np.ascontiguousarray(
+            frame["Low"].to_numpy(dtype=np.float64)
+        ),
+        dates=np.asarray(frame.index, dtype=object),
+    )
 
-    split = max(5, len(anchors) // 2)
-    tuning = anchors[:split]
+
+def _select_weight_profile(frame, features, shapes, config, prepared=None):
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
+    tuning, _evaluation = _audit_anchors(len(frame), config)
+    if len(tuning) < 10:
+        return (
+            "balanced",
+            {
+                "tuning_forecasts": len(tuning),
+                "profiles_tested": 1,
+                "reason": (
+                    "Not enough older checkpoints to separate profile selection "
+                    "from interval calibration."
+                ),
+            },
+            [],
+        )
+
+    calibration_size = max(5, len(tuning) // 3)
+    profile_anchors = tuning[:-calibration_size]
+    calibration_anchors = tuning[-calibration_size:]
     scores = {}
     for profile_key in WEIGHT_PROFILES:
         predictions = _historical_predictions(
-            frame, features, shapes, profile_key, tuning, config
+            frame,
+            features,
+            shapes,
+            profile_key,
+            profile_anchors,
+            config,
+            prepared,
         )
         scores[profile_key] = _brier_score(predictions)
 
@@ -452,24 +556,51 @@ def _select_weight_profile(frame, features, shapes, config):
     )
     if scores[selected] is None:
         selected = "balanced"
-    return selected, {
-        "tuning_forecasts": len(tuning),
-        "profiles_tested": len(WEIGHT_PROFILES),
-        "profile_brier": {
-            key: round(value, 4) if value is not None else None
-            for key, value in scores.items()
+    return (
+        selected,
+        {
+            "tuning_forecasts": len(profile_anchors),
+            "interval_calibration_forecasts": len(calibration_anchors),
+            "profiles_tested": len(WEIGHT_PROFILES),
+            "profile_brier": {
+                key: round(value, 4) if value is not None else None
+                for key, value in scores.items()
+            },
+            "tuning_period": {
+                "start": _date_string(frame.index[profile_anchors[0]]),
+                "end": _date_string(frame.index[profile_anchors[-1]]),
+            },
+            "interval_calibration_period": {
+                "start": _date_string(frame.index[calibration_anchors[0]]),
+                "end": _date_string(frame.index[calibration_anchors[-1]]),
+            },
         },
-    }
+        _historical_predictions(
+            frame,
+            features,
+            shapes,
+            selected,
+            calibration_anchors,
+            config,
+            prepared,
+        ),
+    )
 
 
 def _walk_forward_validation(
-    frame, features, shapes, profile_key, selection, config
+    frame,
+    features,
+    shapes,
+    profile_key,
+    selection,
+    config,
+    prepared=None,
+    calibration_predictions=None,
 ):
-    anchors = _validation_anchors(len(frame), config)
-    split = max(5, len(anchors) // 2)
-    evaluation = anchors[split:] if len(anchors) >= 10 else []
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
+    tuning, evaluation = _audit_anchors(len(frame), config)
     predictions = _historical_predictions(
-        frame, features, shapes, profile_key, evaluation, config
+        frame, features, shapes, profile_key, evaluation, config, prepared
     )
     if len(predictions) < 5:
         return {
@@ -501,7 +632,31 @@ def _walk_forward_validation(
     ) / len(predictions)
     accuracy = correct / len(predictions)
     baseline_accuracy = baseline_correct / len(predictions)
-    interval = _wilson_interval(correct, len(predictions))
+    independent = _non_overlapping_predictions(predictions, config)
+    independent_correct = sum(
+        (item["probability_up"] >= 0.5) == item["actual_up"]
+        for item in independent
+    )
+    interval = _wilson_interval(independent_correct, len(independent))
+    brier_skill = (
+        (1 - model_brier / baseline_brier) * 100
+        if baseline_brier > 1e-12
+        else 0.0
+    )
+    if calibration_predictions is None:
+        calibration_predictions = _historical_predictions(
+            frame,
+            features,
+            shapes,
+            profile_key,
+            tuning,
+            config,
+            prepared,
+        )
+    conformal = _conformal_diagnostics(
+        calibration_predictions,
+        predictions,
+    )
 
     if len(predictions) < 12:
         grade = "limited"
@@ -521,6 +676,7 @@ def _walk_forward_validation(
         "grade": grade,
         "label": label,
         "sample_size": len(predictions),
+        "independent_sample_size": len(independent),
         "correct": correct,
         "accuracy": round(accuracy * 100),
         "accuracy_low": round(interval[0] * 100),
@@ -528,21 +684,65 @@ def _walk_forward_validation(
         "baseline_accuracy": round(baseline_accuracy * 100),
         "brier": round(model_brier, 3),
         "baseline_brier": round(baseline_brier, 3),
+        "brier_skill": round(brier_skill, 1),
+        "conformal": conformal,
         "actionable_count": len(actionable),
         "actionable_accuracy": (
             round(actionable_correct / len(actionable) * 100)
             if actionable else None
         ),
+        "evaluation_frequency_sessions": EVALUATION_STEP,
+        "evaluation_period": {
+            "start": _date_string(frame.index[evaluation[0]]),
+            "end": _date_string(
+                frame.index[evaluation[-1] + config["horizon_days"]]
+            ),
+        },
+        "calibration": _calibration_buckets(predictions),
+        "edge_strata": _prediction_strata(
+            predictions,
+            (
+                ("Under 4 pts", lambda item: abs(item["edge"]) < 0.04),
+                (
+                    "4-8 pts",
+                    lambda item: 0.04 <= abs(item["edge"]) < 0.08,
+                ),
+                ("8+ pts", lambda item: abs(item["edge"]) >= 0.08),
+            ),
+        ),
+        "regime_strata": _prediction_strata(
+            predictions,
+            tuple(
+                (
+                    label,
+                    lambda item, expected=label: (
+                        item["regime"]["trend"] == expected
+                    ),
+                )
+                for label in ("Uptrend", "Transition", "Downtrend")
+            ),
+        ),
+        "strategy": _strategy_audit(predictions, config, frame),
+        "records": [
+            _public_evaluation_record(item)
+            for item in predictions
+        ],
         "selection": selection,
         "explanation": (
             "Each checkpoint used only information available on that date. "
-            "Weight tuning used older checkpoints; these results use the newer "
-            "untouched checkpoints."
+            "Weight tuning used an older period; these five-session records use "
+            "the newer untouched period. Because adjacent outcomes overlap, the "
+            "95% accuracy range uses only non-overlapping checkpoints."
         ),
     }
 
 
 def _validation_anchors(length, config):
+    tuning, evaluation = _audit_anchors(length, config)
+    return tuning + evaluation
+
+
+def _audit_anchors(length, config):
     first = (
         config["warmup"]
         + config["recent_exclusion"]
@@ -550,26 +750,45 @@ def _validation_anchors(length, config):
     )
     last = length - config["horizon_days"] - 1
     if last <= first:
-        return []
-    anchors = list(range(first, last + 1, config["spacing"]))
-    return anchors[-40:]
+        return [], []
+
+    minimum_evaluation_span = (
+        config["horizon_days"] + EVALUATION_STEP * 12
+    )
+    latest_split = last - minimum_evaluation_span
+    if latest_split <= first:
+        return [], []
+    available_span = last - first
+    split = min(
+        first + max(config["spacing"] * 5, round(available_span * 0.4)),
+        latest_split,
+    )
+    tuning = list(range(first, split + 1, config["spacing"]))[-30:]
+    evaluation_start = split + config["horizon_days"]
+    evaluation = list(
+        range(evaluation_start, last + 1, EVALUATION_STEP)
+    )[-MAX_EVALUATION_RECORDS:]
+    return tuning, evaluation
 
 
 def _historical_predictions(
-    frame, features, shapes, profile_key, anchors, config
+    frame, features, shapes, profile_key, anchors, config, prepared=None
 ):
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
     predictions = []
     close = frame["Close"]
+    match_sets = _rank_matches_batch(
+        frame,
+        features,
+        shapes,
+        anchors,
+        profile_key,
+        include_paths=False,
+        config=config,
+        prepared=prepared,
+    )
     for target_position in anchors:
-        matches = _rank_matches(
-            frame,
-            features,
-            shapes,
-            target_position,
-            profile_key,
-            include_paths=False,
-            config=config,
-        )
+        matches = match_sets.get(target_position, [])
         if len(matches) < MIN_MATCHES:
             continue
         summary = _summarize_matches(matches)
@@ -580,16 +799,311 @@ def _historical_predictions(
         ) * 100
         predictions.append(
             {
+                "position": target_position,
+                "date": frame.index[target_position],
+                "horizon_date": frame.index[
+                    target_position + config["horizon_days"]
+                ],
                 "probability_up": summary["analog_probability_up"] / 100,
                 "baseline_up_rate": summary["baseline_up_rate"] / 100,
                 "edge": (
                     summary["analog_probability_up"] - summary["baseline_up_rate"]
                 ) / 100,
                 "median_return": summary["public"]["median_21d"],
+                "actual_return": actual_return,
                 "actual_up": actual_return > 0,
+                "interval_low": summary["public"]["p20_21d"],
+                "interval_high": summary["public"]["p80_21d"],
+                "regime": _classify_regime(features.iloc[target_position]),
+                "match_count": summary["public"]["count"],
+                "effective_matches": summary["public"]["effective_matches"],
             }
         )
     return predictions
+
+
+def _non_overlapping_predictions(predictions, config):
+    selected = []
+    next_position = -1
+    for item in predictions:
+        if item["position"] < next_position:
+            continue
+        selected.append(item)
+        next_position = item["position"] + config["horizon_days"]
+    return selected
+
+
+def _calibration_buckets(predictions):
+    buckets = (
+        ("Under 40%", 0.0, 0.4),
+        ("40-50%", 0.4, 0.5),
+        ("50-60%", 0.5, 0.6),
+        ("60%+", 0.6, 1.000001),
+    )
+    result = []
+    for label, low, high in buckets:
+        items = [
+            item
+            for item in predictions
+            if low <= item["probability_up"] < high
+        ]
+        if not items:
+            continue
+        predicted = sum(item["probability_up"] for item in items) / len(items)
+        observed = sum(item["actual_up"] for item in items) / len(items)
+        result.append(
+            {
+                "label": label,
+                "count": len(items),
+                "predicted_up": round(predicted * 100, 1),
+                "observed_up": round(observed * 100, 1),
+                "gap_points": round((predicted - observed) * 100, 1),
+            }
+        )
+    return result
+
+
+def _conformal_diagnostics(calibration, evaluation, target_coverage=0.80):
+    if len(calibration) < 5 or not evaluation:
+        return {
+            "available": False,
+            "reason": "Not enough older forecasts to calibrate interval coverage.",
+            "adjustment_points": 0.0,
+        }
+    scores = sorted(
+        max(
+            item["interval_low"] - item["actual_return"],
+            item["actual_return"] - item["interval_high"],
+            0.0,
+        )
+        for item in calibration
+    )
+    rank = math.ceil((len(scores) + 1) * target_coverage) - 1
+    adjustment = scores[min(len(scores) - 1, max(0, rank))]
+    adjustment = math.ceil(adjustment * 100) / 100
+    raw_covered = sum(
+        item["interval_low"]
+        <= item["actual_return"]
+        <= item["interval_high"]
+        for item in evaluation
+    )
+    adjusted_covered = sum(
+        item["interval_low"] - adjustment
+        <= item["actual_return"]
+        <= item["interval_high"] + adjustment
+        for item in evaluation
+    )
+    raw_width = sum(
+        item["interval_high"] - item["interval_low"]
+        for item in evaluation
+    ) / len(evaluation)
+    return {
+        "available": True,
+        "target_coverage": round(target_coverage * 100),
+        "calibration_sample": len(calibration),
+        "evaluation_sample": len(evaluation),
+        "raw_coverage": round(raw_covered / len(evaluation) * 100),
+        "adjusted_coverage": round(
+            adjusted_covered / len(evaluation) * 100
+        ),
+        "adjustment_points": adjustment,
+        "average_raw_width": round(raw_width, 2),
+        "average_adjusted_width": round(raw_width + adjustment * 2, 2),
+        "method": (
+            "Split conformal expansion calibrated only on the older tuning "
+            "period, then measured on untouched evaluation forecasts."
+        ),
+    }
+
+
+def _prediction_strata(predictions, definitions):
+    result = []
+    for label, predicate in definitions:
+        items = [item for item in predictions if predicate(item)]
+        if not items:
+            continue
+        correct = sum(
+            (item["probability_up"] >= 0.5) == item["actual_up"]
+            for item in items
+        )
+        brier = _brier_score(items)
+        result.append(
+            {
+                "label": label,
+                "count": len(items),
+                "accuracy": round(correct / len(items) * 100),
+                "brier": round(brier, 3),
+                "average_edge_points": round(
+                    sum(abs(item["edge"]) for item in items)
+                    / len(items)
+                    * 100,
+                    1,
+                ),
+                "average_return": round(
+                    sum(item["actual_return"] for item in items)
+                    / len(items),
+                    2,
+                ),
+            }
+        )
+    return result
+
+
+def _historical_signal(item):
+    if item["edge"] >= 0.04 and item["median_return"] > 0.5:
+        return "bullish"
+    if item["edge"] <= -0.04 and item["median_return"] < -0.5:
+        return "bearish"
+    return "neutral"
+
+
+def _strategy_audit(predictions, config, frame):
+    periods = _non_overlapping_predictions(predictions, config)
+    if not periods:
+        return {
+            "available": False,
+            "periods": 0,
+            "trades": 0,
+            "curve": [],
+            "hold_curve": [],
+        }
+
+    start_position = periods[0]["position"]
+    end_position = (
+        periods[-1]["position"] + config["horizon_days"]
+    )
+    close = frame["Close"].to_numpy(dtype=float)
+    held = np.zeros(end_position - start_position + 1, dtype=bool)
+    trades = 0
+    wins = 0
+    for item in periods:
+        if _historical_signal(item) != "bullish":
+            continue
+        trades += 1
+        wins += item["actual_return"] > 0
+        interval_start = item["position"] - start_position + 1
+        interval_end = (
+            item["position"]
+            - start_position
+            + config["horizon_days"]
+            + 1
+        )
+        held[interval_start:interval_end] = True
+
+    strategy_equity = 100.0
+    start_date = _date_string(frame.index[start_position])
+    strategy_curve = [{"date": start_date, "value": 100.0}]
+    hold_curve = [{"date": start_date, "value": 100.0}]
+    for position in range(start_position + 1, end_position + 1):
+        offset = position - start_position
+        daily_return = close[position] / close[position - 1] - 1
+        if held[offset]:
+            strategy_equity *= 1 + daily_return
+        hold_equity = close[position] / close[start_position] * 100
+        date = _date_string(frame.index[position])
+        strategy_curve.append(
+            {"date": date, "value": round(strategy_equity, 2)}
+        )
+        hold_curve.append({"date": date, "value": round(hold_equity, 2)})
+
+    hold_equity = hold_curve[-1]["value"]
+    strategy_drawdown = _curve_drawdown(strategy_curve)
+    hold_drawdown = _curve_drawdown(hold_curve)
+    return {
+        "available": True,
+        "periods": len(periods),
+        "trades": trades,
+        "trade_win_rate": round(wins / trades * 100) if trades else None,
+        "exposure": round(float(held[1:].mean()) * 100),
+        "strategy_return": round(strategy_equity - 100, 1),
+        "hold_return": round(hold_equity - 100, 1),
+        "excess_return": round(strategy_equity - hold_equity, 1),
+        "max_drawdown": strategy_drawdown,
+        "hold_max_drawdown": hold_drawdown,
+        "curve": _downsample_curve(strategy_curve),
+        "hold_curve": _downsample_curve(hold_curve),
+        "note": (
+            "Daily mark-to-market, non-overlapping long-or-cash signals versus "
+            "continuous buy-and-hold; excludes fees, spreads, and taxes."
+        ),
+    }
+
+
+def _curve_drawdown(curve):
+    peak = 100.0
+    worst = 0.0
+    for point in curve:
+        value = point["value"]
+        peak = max(peak, value)
+        if peak:
+            worst = min(worst, (value / peak - 1) * 100)
+    return round(worst, 1)
+
+
+def _downsample_curve(curve, max_points=120):
+    if len(curve) <= max_points:
+        return curve
+    positions = np.linspace(
+        0,
+        len(curve) - 1,
+        max_points,
+        dtype=int,
+    )
+    return [curve[position] for position in np.unique(positions)]
+
+
+def _public_evaluation_record(item):
+    signal = _historical_signal(item)
+    if signal == "bullish":
+        signal_correct = item["actual_return"] > 0
+    elif signal == "bearish":
+        signal_correct = item["actual_return"] < 0
+    else:
+        signal_correct = None
+    return {
+        "date": _date_string(item["date"]),
+        "horizon_date": _date_string(item["horizon_date"]),
+        "probability_up": round(item["probability_up"] * 100, 1),
+        "baseline_up_rate": round(item["baseline_up_rate"] * 100, 1),
+        "edge_points": round(item["edge"] * 100, 1),
+        "median_return": round(item["median_return"], 2),
+        "actual_return": round(item["actual_return"], 2),
+        "actual_up": item["actual_up"],
+        "probability_correct": (
+            (item["probability_up"] >= 0.5) == item["actual_up"]
+        ),
+        "signal": signal,
+        "signal_correct": signal_correct,
+        "regime": item["regime"]["label"],
+        "match_count": item["match_count"],
+        "effective_matches": item["effective_matches"],
+    }
+
+
+def _rank_matches_batch(
+    frame,
+    features,
+    shapes,
+    target_positions,
+    profile_key,
+    include_paths,
+    config,
+    prepared=None,
+):
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
+    return {
+        target_position: _rank_matches(
+            frame,
+            features,
+            shapes,
+            target_position,
+            profile_key,
+            include_paths=include_paths,
+            config=config,
+            prepared=prepared,
+        )
+        for target_position in target_positions
+    }
 
 
 def _rank_matches(
@@ -600,29 +1114,38 @@ def _rank_matches(
     profile_key,
     include_paths,
     config=None,
+    prepared=None,
 ):
     config = config or _sampling_config(frame)
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
     candidate_end = target_position - config["recent_exclusion"]
     if candidate_end <= config["warmup"]:
         return []
     positions = np.arange(config["warmup"], candidate_end + 1, dtype=int)
     profile = WEIGHT_PROFILES[profile_key]
-    target = features.iloc[target_position]
+    target_values_all = prepared.feature_values[target_position]
 
     usable = []
+    usable_indices = []
     feature_weights = []
     for name, weight in profile["weights"].items():
-        if name not in features or not np.isfinite(target.get(name, float("nan"))):
+        column = prepared.feature_columns.get(name)
+        if column is None or not np.isfinite(target_values_all[column]):
             continue
-        coverage = features.iloc[positions][name].notna().mean()
+        coverage = np.isfinite(
+            prepared.feature_values[positions, column]
+        ).mean()
         if coverage >= 0.75:
             usable.append(name)
+            usable_indices.append(column)
             feature_weights.append(weight)
     if len(usable) < 6:
         return []
 
-    candidate_values = features.iloc[positions][usable].to_numpy(dtype=float)
-    target_values = target[usable].to_numpy(dtype=float)
+    candidate_values = prepared.feature_values[
+        np.ix_(positions, np.asarray(usable_indices, dtype=int))
+    ]
+    target_values = target_values_all[usable_indices]
     medians = np.nanmedian(candidate_values, axis=0)
     deviations = np.nanmedian(np.abs(candidate_values - medians), axis=0) * 1.4826
     standard = np.nanstd(candidate_values, axis=0)
@@ -647,10 +1170,12 @@ def _rank_matches(
     distance_numerator = differences @ weights
     minimum_coverage = float(weights.sum()) * 0.75
 
-    target_shape = shapes[target_position]
+    target_shape = prepared.shapes[target_position]
     shape_weight = profile["shape"]
+    shape_distance = np.full(len(positions), np.nan, dtype=float)
+    shape_valid = np.zeros(len(positions), dtype=bool)
     if np.isfinite(target_shape).all():
-        candidate_shapes = shapes[positions]
+        candidate_shapes = prepared.shapes[positions]
         shape_valid = np.isfinite(candidate_shapes).all(axis=1)
         shape_distance = np.sqrt(
             np.nanmean((candidate_shapes - target_shape) ** 2, axis=1)
@@ -675,9 +1200,13 @@ def _rank_matches(
     for position, distance in ranked:
         if any(abs(position - used) < config["spacing"] for used in used_positions):
             continue
-        selected.append(_match_record(
-            frame, features, position, distance, include_paths, config
-        ))
+        selected.append(
+            _match_record(
+                frame, features, position, distance, True, config
+            )
+            if include_paths
+            else _match_record_fast(prepared, position, distance, config)
+        )
         used_positions.append(position)
         if len(selected) == MAX_MATCHES:
             break
@@ -692,24 +1221,80 @@ def _rank_matches(
         match["quality"] = max(
             1, min(99, round(100 * math.exp(-0.5 * match["distance"])))
         )
+        match["_horizon_days"] = config["horizon_days"]
+        match["_sampling"] = config["sampling"]
+
+    if include_paths:
+        position_offset = int(positions[0])
+        for match in selected:
+            candidate_index = match["position"] - position_offset
+            supports = []
+            for feature_index, (name, feature_weight) in enumerate(
+                zip(usable, feature_weights)
+            ):
+                if not valid[candidate_index, feature_index]:
+                    continue
+                difference = abs(
+                    normalized_candidates[candidate_index, feature_index]
+                    - normalized_target[feature_index]
+                )
+                closeness = math.exp(-0.5 * difference)
+                supports.append(
+                    {
+                        "label": FEATURE_LABELS[name],
+                        "closeness": round(closeness * 100),
+                        "_support": feature_weight * closeness,
+                    }
+                )
+            if shape_valid[candidate_index]:
+                closeness = math.exp(
+                    -0.5 * shape_distance[candidate_index]
+                )
+                supports.append(
+                    {
+                        "label": (
+                            f"{config['shape_days']}-day chart shape"
+                        ),
+                        "closeness": round(closeness * 100),
+                        "_support": shape_weight * closeness,
+                    }
+                )
+            total_support = sum(item["_support"] for item in supports) or 1.0
+            match["contributions"] = [
+                {
+                    "label": item["label"],
+                    "closeness": item["closeness"],
+                    "share": round(item["_support"] / total_support * 100),
+                }
+                for item in sorted(
+                    supports,
+                    key=lambda item: item["_support"],
+                    reverse=True,
+                )[:6]
+            ]
     close = frame["Close"]
-    baseline_positions = range(
-        config["warmup"],
-        candidate_end + 1,
-        config["horizon_days"],
-    )
-    baseline_outcomes = [
-        float(close.iloc[position + config["horizon_days"]])
-        > float(close.iloc[position])
-        for position in baseline_positions
-        if position + config["horizon_days"] < target_position
-    ]
-    baseline = (
-        (sum(baseline_outcomes) + 0.5) / (len(baseline_outcomes) + 1)
-        if baseline_outcomes else 0.5
-    )
+    baseline_rates = {}
+    for horizon in sorted({5, 10, config["horizon_days"]}):
+        baseline_positions = range(
+            config["warmup"],
+            candidate_end + 1,
+            horizon,
+        )
+        baseline_outcomes = [
+            float(close.iloc[position + horizon])
+            > float(close.iloc[position])
+            for position in baseline_positions
+            if position + horizon < target_position
+        ]
+        baseline_rates[horizon] = (
+            (sum(baseline_outcomes) + 0.5)
+            / (len(baseline_outcomes) + 1)
+            if baseline_outcomes
+            else 0.5
+        )
     for match in selected:
-        match["_baseline_up_rate"] = baseline
+        match["_baseline_up_rates"] = baseline_rates
+        match["_baseline_up_rate"] = baseline_rates[config["horizon_days"]]
     return selected
 
 
@@ -746,6 +1331,33 @@ def _match_record(
     }
 
 
+def _match_record_fast(prepared, position, distance, config):
+    horizon = config["horizon_days"]
+    entry = prepared.close[position]
+    future = prepared.close[position : position + horizon + 1]
+    path = (future / entry - 1) * 100
+    high_path = (
+        prepared.high[position + 1 : position + horizon + 1] / entry - 1
+    ) * 100
+    low_path = (
+        prepared.low[position + 1 : position + horizon + 1] / entry - 1
+    ) * 100
+    return {
+        "position": position,
+        "date": prepared.dates[position],
+        "distance": distance,
+        "fwd_5d": float(path[5]),
+        "fwd_10d": float(path[10]),
+        "fwd_21d": float(path[horizon]),
+        "max_upside": float(np.max(high_path)),
+        "max_drawdown": float(np.min(low_path)),
+        "path": [],
+        "high_path": [],
+        "low_path": [],
+        "regime": {},
+    }
+
+
 def _stable_distance_weights(distances):
     if len(distances) == 1:
         return [1.0]
@@ -770,8 +1382,6 @@ def _summarize_matches(matches):
     fwd5 = [match["fwd_5d"] for match in matches]
     fwd10 = [match["fwd_10d"] for match in matches]
     fwd21 = [match["fwd_21d"] for match in matches]
-    base_values = [1.0 if value > 0 else 0.0 for value in fwd21]
-    weighted_rate = sum(weight * value for weight, value in zip(weights, base_values))
 
     positions = [match["position"] for match in matches]
     distinct_years = len({_year(match["date"]) for match in matches})
@@ -779,19 +1389,61 @@ def _summarize_matches(matches):
     cluster_ceiling = max(4.0, distinct_years * 1.5)
     effective_n = max(1.0, min(raw_ess, cluster_ceiling, len(matches)))
 
-    # This as-of base rate uses non-overlapping outcomes available before the target.
-    baseline = matches[0].get("_baseline_up_rate", 0.5)
-
-    alpha = baseline * PRIOR_STRENGTH + weighted_rate * effective_n
-    beta = (1 - baseline) * PRIOR_STRENGTH + (1 - weighted_rate) * effective_n
-    probability = alpha / (alpha + beta)
-    probability_low = _beta_ppf(0.10, alpha, beta)
-    probability_high = _beta_ppf(0.90, alpha, beta)
+    primary_days = matches[0].get("_horizon_days", 21)
+    sampling = matches[0].get("_sampling", "sessions")
+    baselines = matches[0].get(
+        "_baseline_up_rates",
+        {primary_days: matches[0].get("_baseline_up_rate", 0.5)},
+    )
+    horizon_inputs = (
+        (5, fwd5),
+        (10, fwd10),
+        (primary_days, fwd21),
+    )
+    horizons = []
+    seen = set()
+    for days, values in horizon_inputs:
+        if days in seen:
+            continue
+        seen.add(days)
+        baseline = baselines.get(days, 0.5)
+        raw_rate = sum(
+            weight * (value > 0)
+            for weight, value in zip(weights, values)
+        )
+        alpha = baseline * PRIOR_STRENGTH + raw_rate * effective_n
+        beta = (
+            (1 - baseline) * PRIOR_STRENGTH
+            + (1 - raw_rate) * effective_n
+        )
+        horizons.append(
+            {
+                "days": days,
+                "label": (
+                    f"{days} calendar days"
+                    if sampling == "calendar_daily"
+                    else f"{days} sessions"
+                ),
+                "raw_probability_up": raw_rate * 100,
+                "probability_up": alpha / (alpha + beta) * 100,
+                "probability_low": _beta_ppf(0.10, alpha, beta) * 100,
+                "probability_high": _beta_ppf(0.90, alpha, beta) * 100,
+                "baseline_up_rate": baseline * 100,
+                "median_return": _weighted_quantile(values, weights, 0.5),
+                "low_return": _weighted_quantile(values, weights, 0.2),
+                "high_return": _weighted_quantile(values, weights, 0.8),
+                "wins": sum(value > 0 for value in values),
+            }
+        )
+    primary = next(
+        item for item in horizons
+        if item["days"] == primary_days
+    )
 
     public = {
         "count": len(matches),
         "wins_21d": sum(value > 0 for value in fwd21),
-        "win_rate_21d": round(weighted_rate * 100),
+        "win_rate_21d": round(primary["raw_probability_up"]),
         "wins_5d": sum(value > 0 for value in fwd5),
         "win_rate_5d": round(
             sum(weight * (value > 0) for weight, value in zip(weights, fwd5)) * 100
@@ -807,26 +1459,50 @@ def _summarize_matches(matches):
         "worst_21d": round(min(fwd21), 2),
         "effective_matches": round(effective_n, 1),
         "distinct_years": distinct_years,
+        "horizons": [
+            {
+                **item,
+                "raw_probability_up": round(item["raw_probability_up"]),
+                "probability_up": round(item["probability_up"]),
+                "probability_low": round(item["probability_low"]),
+                "probability_high": round(item["probability_high"]),
+                "baseline_up_rate": round(item["baseline_up_rate"]),
+                "median_return": round(item["median_return"], 2),
+                "low_return": round(item["low_return"], 2),
+                "high_return": round(item["high_return"], 2),
+            }
+            for item in horizons
+        ],
     }
     return {
         "public": public,
         "weights": weights,
-        "analog_probability_up": probability * 100,
-        "probability_low": probability_low * 100,
-        "probability_high": probability_high * 100,
-        "baseline_up_rate": baseline * 100,
+        "horizons": horizons,
+        "raw_match_probability_up": primary["raw_probability_up"],
+        "analog_probability_up": primary["probability_up"],
+        "probability_low": primary["probability_low"],
+        "probability_high": primary["probability_high"],
+        "baseline_up_rate": primary["baseline_up_rate"],
     }
 
 
 def _build_forecast(summary, news_score, news_count, validation, config):
-    analog = summary["analog_probability_up"]
-    baseline = summary["baseline_up_rate"]
+    analog = max(1.0, min(99.0, summary["analog_probability_up"]))
+    baseline = max(1.0, min(99.0, summary["baseline_up_rate"]))
+    raw_match_probability = max(
+        1.0,
+        min(99.0, summary["raw_match_probability_up"]),
+    )
     consistency = min(1.0, max(0.0, news_count) / 5) ** 0.5
-    news_adjustment = max(
+    requested_news_adjustment = max(
         -MAX_NEWS_ADJUSTMENT,
         min(MAX_NEWS_ADJUSTMENT, news_score * consistency * MAX_NEWS_ADJUSTMENT),
     )
-    combined = max(1.0, min(99.0, analog + news_adjustment))
+    combined = max(
+        1.0,
+        min(99.0, analog + requested_news_adjustment),
+    )
+    news_adjustment = combined - analog
     edge = analog - baseline
     stats = summary["public"]
 
@@ -851,6 +1527,27 @@ def _build_forecast(summary, news_score, news_count, validation, config):
         + min(1, stats["distinct_years"] / 8) * 15
         + validation_factor * 15
     )
+    conformal = validation.get("conformal", {})
+    interval_adjustment = (
+        float(conformal.get("adjustment_points", 0.0))
+        if conformal.get("available")
+        else 0.0
+    )
+    horizon_forecasts = []
+    for item in stats["horizons"]:
+        horizon_edge = item["probability_up"] - item["baseline_up_rate"]
+        horizon_direction = "neutral"
+        if horizon_edge >= 4 and item["median_return"] > 0.25:
+            horizon_direction = "bullish"
+        elif horizon_edge <= -4 and item["median_return"] < -0.25:
+            horizon_direction = "bearish"
+        horizon_forecasts.append(
+            {
+                **item,
+                "edge_points": round(horizon_edge, 1),
+                "direction": horizon_direction,
+            }
+        )
 
     return {
         "horizon_days": config["horizon_days"],
@@ -867,16 +1564,153 @@ def _build_forecast(summary, news_score, news_count, validation, config):
         "probability_high": round(summary["probability_high"]),
         "evidence_score": max(10, min(95, round(evidence_score))),
         "range_21d": {
+            "low": round(stats["p20_21d"] - interval_adjustment, 2),
+            "typical": stats["median_21d"],
+            "high": round(stats["p80_21d"] + interval_adjustment, 2),
+        },
+        "raw_range_21d": {
             "low": stats["p20_21d"],
             "typical": stats["median_21d"],
             "high": stats["p80_21d"],
         },
+        "interval_adjustment_points": round(interval_adjustment, 2),
+        "horizons": horizon_forecasts,
+        "waterfall": [
+            {
+                "label": "Asset base rate",
+                "value": round(baseline, 1),
+                "delta": 0.0,
+            },
+            {
+                "label": "Raw matched paths",
+                "value": round(raw_match_probability, 1),
+                "delta": round(
+                    raw_match_probability - baseline,
+                    1,
+                ),
+            },
+            {
+                "label": "Base-rate shrinkage",
+                "value": round(analog, 1),
+                "delta": round(
+                    analog - raw_match_probability,
+                    1,
+                ),
+            },
+            {
+                "label": "Current news",
+                "value": round(combined, 1),
+                "delta": round(combined - analog, 1),
+            },
+        ],
+        "agreement": _agreement_summary(
+            summary,
+            stats,
+            news_score,
+            news_count,
+            analog_direction,
+        ),
         "explanation": (
             f"Closest setups imply {round(analog)}% odds of finishing higher, "
             f"versus this asset's {round(baseline)}% normal historical rate. "
             f"Recent headlines adjust the displayed estimate by {news_adjustment:+.1f} points."
         ),
     }
+
+
+def _agreement_summary(
+    summary,
+    stats,
+    news_score,
+    news_count,
+    analog_direction,
+):
+    components = [
+        {
+            "label": "Matched path vote",
+            "state": _signal_state(
+                summary["raw_match_probability_up"] - 50,
+                4,
+            ),
+            "detail": (
+                f"{round(summary['raw_match_probability_up'])}% of weighted "
+                "paths finished higher"
+            ),
+            "weight": 2.0,
+        },
+        {
+            "label": "Typical path",
+            "state": _signal_state(stats["median_21d"], 0.5),
+            "detail": f"{stats['median_21d']:+.1f}% median finish",
+            "weight": 1.5,
+        },
+    ]
+    if news_count:
+        components.append(
+            {
+                "label": "Current headlines",
+                "state": _signal_state(news_score, 0.15),
+                "detail": f"{news_count} recent articles scored",
+                "weight": 0.5,
+            }
+        )
+    reference = analog_direction
+    if reference == "neutral":
+        directional = [
+            item["state"]
+            for item in components
+            if item["state"] != "neutral"
+        ]
+        bullish_count = directional.count("bullish")
+        bearish_count = directional.count("bearish")
+        reference = (
+            "bullish"
+            if bullish_count > bearish_count
+            else "bearish"
+            if bearish_count > bullish_count
+            else "neutral"
+        )
+    total_weight = sum(item["weight"] for item in components)
+    aligned = sum(
+        item["weight"]
+        * (
+            1.0
+            if item["state"] == reference
+            else 0.5
+            if item["state"] == "neutral"
+            else 0.0
+        )
+        for item in components
+    )
+    score = round(aligned / total_weight * 100) if total_weight else 50
+    label = (
+        "Broad agreement"
+        if score >= 75
+        else "Partial agreement"
+        if score >= 50
+        else "Conflicting evidence"
+    )
+    return {
+        "score": score,
+        "label": label,
+        "reference": reference,
+        "components": [
+            {
+                key: value
+                for key, value in item.items()
+                if key != "weight"
+            }
+            for item in components
+        ],
+    }
+
+
+def _signal_state(value, threshold):
+    if value >= threshold:
+        return "bullish"
+    if value <= -threshold:
+        return "bearish"
+    return "neutral"
 
 
 def _build_verdict(forecast, summary):
@@ -1002,7 +1836,7 @@ def _build_trade_plan(price, matches, summary, verdict, config):
     }
 
 
-def _projection(matches, config):
+def _projection(matches, config, interval_adjustment=0.0):
     path_matches = [match for match in matches if match["path"]]
     if not path_matches:
         return {"days": [], "low": [], "median": [], "high": []}
@@ -1013,10 +1847,31 @@ def _projection(matches, config):
     high = []
     for day in days:
         values = [match["path"][day] for match in path_matches]
-        low.append(round(_weighted_quantile(values, weights, 0.2), 3))
+        day_adjustment = interval_adjustment * math.sqrt(
+            day / max(1, config["horizon_days"])
+        )
+        low.append(
+            round(
+                _weighted_quantile(values, weights, 0.2)
+                - day_adjustment,
+                3,
+            )
+        )
         median.append(round(_weighted_quantile(values, weights, 0.5), 3))
-        high.append(round(_weighted_quantile(values, weights, 0.8), 3))
-    return {"days": days, "low": low, "median": median, "high": high}
+        high.append(
+            round(
+                _weighted_quantile(values, weights, 0.8)
+                + day_adjustment,
+                3,
+            )
+        )
+    return {
+        "days": days,
+        "low": low,
+        "median": median,
+        "high": high,
+        "interval_adjustment_points": round(interval_adjustment, 2),
+    }
 
 
 def _public_match(match):
@@ -1036,6 +1891,7 @@ def _public_match(match):
         "fwd_21d": round(match["fwd_21d"], 2),
         "max_upside": round(match["max_upside"], 2),
         "max_drawdown": round(match["max_drawdown"], 2),
+        "contributions": match.get("contributions", []),
     }
 
 

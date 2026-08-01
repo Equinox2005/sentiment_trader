@@ -1,8 +1,14 @@
 const state = {
   analysis: null,
   request: null,
+  trackRequest: null,
+  timeRequest: null,
+  watchRefresh: null,
+  selectedTwin: null,
+  activeView: document.body.dataset.initialView || "forecast",
   showAllReceipts: false,
   watchlist: readStoredList(),
+  watchData: readStoredInsights(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -44,38 +50,41 @@ function readStoredList() {
   }
 }
 
+function readStoredInsights() {
+  try {
+    const value = JSON.parse(storageGet("playbook-watch-data") || "{}");
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 function saveWatchlist() {
   storageSet("playbook-watchlist", JSON.stringify(state.watchlist));
 }
 
-const LOADING_LINES = [
-  "Building today’s market fingerprint…",
-  "Comparing the 21-day chart shape…",
-  "Searching twenty years for independent twins…",
-  "Replaying every matched future…",
-  "Running untouched walk-forward checks…",
-  "Applying today’s bounded news adjustment…",
-];
-let loadingTimer = null;
+function saveWatchInsights() {
+  storageSet("playbook-watch-data", JSON.stringify(state.watchData));
+}
 
 function startLoading() {
-  let index = 0;
-  clearInterval(loadingTimer);
   $("loadingStrip").hidden = false;
-  $("loadingText").textContent = LOADING_LINES[0];
-  loadingTimer = setInterval(() => {
-    index = (index + 1) % LOADING_LINES.length;
-    $("loadingText").textContent = LOADING_LINES[index];
-  }, 1500);
+  setLoadingStage("Fetching adjusted prices and current headlines…", 8);
+}
+
+function setLoadingStage(message, progress) {
+  $("loadingText").textContent = message;
+  $("loadingBar").style.width = `${Math.max(0, Math.min(100, progress))}%`;
 }
 
 function stopLoading() {
-  clearInterval(loadingTimer);
-  loadingTimer = null;
+  setLoadingStage("Forecast and audit ready.", 100);
   $("loadingStrip").hidden = true;
 }
 
-async function loadSymbol(rawSymbol) {
+async function loadSymbol(rawSymbol, options = {}) {
   const symbol = String(rawSymbol || "")
     .trim()
     .toUpperCase()
@@ -86,33 +95,89 @@ async function loadSymbol(rawSymbol) {
   }
 
   if (state.request) state.request.abort();
+  if (state.trackRequest) state.trackRequest.abort();
+  if (state.timeRequest) state.timeRequest.abort();
   const controller = new AbortController();
   state.request = controller;
+  state.selectedTwin = null;
   $("statusMessage").textContent = "";
   $("symbolInput").value = symbol;
+  $("trackSummary").replaceChildren();
+  $("trackRecordList").replaceChildren();
+  $("trackRecordEmpty").hidden = false;
+  $("timeMachineResult").hidden = true;
+  $("timeMachineStatus").textContent = "";
   startLoading();
+  let quickRendered = false;
+  let pendingInitialLocation = null;
+  const requestedView = options.view || "forecast";
+  const requestedHash = options.initial ? window.location.hash : "";
 
   try {
-    const response = await fetch(`/api/analyze/${encodeURIComponent(symbol)}`, {
+    const quickResponse = await fetch(`/api/analyze/${encodeURIComponent(symbol)}/quick`, {
       signal: controller.signal,
       headers: { Accept: "application/json" },
     });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Playbook could not build this forecast.");
+    const quick = await quickResponse.json();
+    if (!quickResponse.ok) {
+      throw new Error(quick.error || "Playbook could not build this forecast.");
     }
     if (state.request !== controller) return;
 
-    state.analysis = payload;
+    state.analysis = quick;
+    quickRendered = true;
     state.showAllReceipts = false;
-    render(payload);
-    const url = new URL(window.location.href);
-    url.searchParams.set("symbol", payload.symbol);
-    window.history.replaceState({}, "", url);
-    storageSet("playbook-last-symbol", payload.symbol);
+    setLoadingStage("Historical twins found. Painting the preliminary forecast…", 58);
+    render(quick);
+    updateRoute(quick.symbol, requestedView, requestedHash);
+    if (options.initial) {
+      pendingInitialLocation = `${window.location.pathname}${window.location.hash}`;
+    }
+    storageSet("playbook-last-symbol", quick.symbol);
+
+    setLoadingStage("Running untouched walk-forward audit checkpoints…", 72);
+    const auditUrl = `/api/analyze/${encodeURIComponent(symbol)}/audit?snapshot=${encodeURIComponent(quick.snapshot_id)}`;
+    const auditResponse = await fetch(auditUrl, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    const audited = await auditResponse.json();
+    if (!auditResponse.ok) {
+      throw new Error(audited.error || "The forecast loaded, but its audit did not.");
+    }
+    if (state.request !== controller) return;
+    if (audited.snapshot_id !== quick.snapshot_id) {
+      throw new Error(
+        "Market data changed while the audit was running; search again for one coherent snapshot.",
+      );
+    }
+    state.analysis = audited;
+    setLoadingStage("Calibrating evidence and finalizing the forecast…", 94);
+    render(audited);
+    loadTrackRecord(audited.symbol);
+    const requestedTarget = requestedHash
+      ? document.querySelector(requestedHash)
+      : requestedView === "audit"
+        ? $("auditCenter")
+        : null;
+    const currentLocation = `${window.location.pathname}${window.location.hash}`;
+    if (requestedTarget && currentLocation === pendingInitialLocation) {
+      const sectionByHash = {
+        "#verdictCard": "forecast",
+        "#chartPanel": "twins",
+        "#auditCenter": "audit",
+        "#trackRecordPanel": "track",
+      };
+      setActiveNav(sectionByHash[requestedHash] || requestedView);
+      requestAnimationFrame(() => {
+        requestedTarget.scrollIntoView({ behavior: "auto", block: "start" });
+      });
+    }
   } catch (error) {
     if (error.name !== "AbortError" && state.request === controller) {
-      $("statusMessage").textContent = error.message;
+      $("statusMessage").textContent = quickRendered
+        ? `Preliminary forecast shown. Audit unavailable: ${error.message}`
+        : error.message;
     }
   } finally {
     if (state.request === controller) {
@@ -124,6 +189,10 @@ async function loadSymbol(rawSymbol) {
 
 function render(data) {
   const play = data.playbook;
+  document.body.classList.add("has-analysis");
+  $("sectionNav").hidden = false;
+  $("navSymbol").textContent = data.symbol;
+  $("workspace").dataset.stage = data.stage;
   $("workspace").hidden = false;
   $("assetSymbol").textContent = data.symbol;
   $("assetName").textContent = [data.name, data.sector].filter(Boolean).join(" · ");
@@ -136,7 +205,11 @@ function render(data) {
     renderFingerprint(play);
     renderRange(play);
     renderReliability(play.validation);
+    renderAudit(play.validation);
+    renderWaterfall(play.forecast);
+    renderAgreement(play.forecast.agreement);
     renderReceipts(play);
+    renderTwinExplorer(play);
     renderPlan(data);
     renderCatalyst(play.catalyst);
   } else {
@@ -146,6 +219,8 @@ function render(data) {
   renderStory(data.story);
   renderNews(data);
   renderChart();
+  setTimeMachineBounds(data);
+  rememberWatchInsight(data);
   updateWatchButton();
   const warnings = data.warnings.length
     ? ` Data notes: ${data.warnings.join(" ")}`
@@ -166,11 +241,16 @@ function renderForecast(play) {
     verdict.direction === "bullish" ? "↗" : verdict.direction === "bearish" ? "↘" : "⇄";
   $("verdictHeadline").textContent = verdict.headline;
   $("verdictExplanation").textContent = verdict.explanation;
-  $("horizonKicker").textContent = `${forecast.horizon_label} analog forecast`;
+  $("horizonKicker").textContent =
+    `${play.preliminary ? "Preliminary · " : ""}${forecast.horizon_label} analog forecast`;
   $("setupLine").textContent = play.setup;
   $("setupLine").hidden = false;
 
   $("probabilityValue").textContent = `${forecast.probability_up}%`;
+  $("probabilityRing").style.setProperty(
+    "--probability",
+    `${forecast.probability_up * 3.6}deg`,
+  );
   $("probabilityInterval").textContent =
     `Analog evidence range: ${forecast.probability_low}–${forecast.probability_high}%`;
   $("gaugeFill").style.width = `${forecast.evidence_score}%`;
@@ -189,6 +269,64 @@ function renderForecast(play) {
     `${forecast.edge_points >= 0 ? "+" : ""}${forecast.edge_points} pts`;
   $("analogEdge").className =
     forecast.edge_points > 0 ? "positive" : forecast.edge_points < 0 ? "negative" : "";
+
+  const edgeState = $("edgeState");
+  const auditGrade = play.validation.grade;
+  const auditSupported = play.validation.available && auditGrade === "positive";
+  const unsupportedLean = (direction) => auditGrade === "mixed"
+    ? `${direction} lean with mixed audit evidence`
+    : `${direction} lean without enough audit support`;
+  edgeState.textContent = play.preliminary
+    ? "Preliminary balanced match"
+    : verdict.direction === "bullish"
+      ? auditSupported
+        ? "Audit-supported bullish edge"
+        : unsupportedLean("Bullish")
+      : verdict.direction === "bearish"
+        ? auditSupported
+          ? "Audit-supported bearish edge"
+          : unsupportedLean("Bearish")
+        : forecast.analog_direction !== "neutral"
+          ? "Historical lean, current conflict"
+          : "No meaningful analog edge";
+  edgeState.dataset.state = verdict.direction;
+
+  const guardrails = [];
+  if (play.preliminary) {
+    guardrails.push("Adaptive weights and untouched audit are still running.");
+  } else {
+    if (!play.validation.available) {
+      guardrails.push(
+        play.validation.reason
+        || "There are not enough untouched forecasts to establish reliability.",
+      );
+    } else if (play.validation.grade === "limited") {
+      guardrails.push("The untouched audit sample is still too limited for a supported call.");
+    } else if (play.validation.grade === "mixed") {
+      guardrails.push(
+        "The untouched audit is mixed and has not met both tests for historical usefulness.",
+      );
+    } else if (play.validation.grade === "weak") {
+      guardrails.push("This matcher has not beaten its baseline reliably for this asset.");
+    }
+    const conformal = play.validation.conformal;
+    if (
+      conformal?.available
+      && conformal.adjusted_coverage < conformal.target_coverage - 5
+    ) {
+      guardrails.push(
+        `The projection interval covered ${conformal.adjusted_coverage}% of holdout outcomes, ` +
+        `below its ${conformal.target_coverage}% target.`,
+      );
+    }
+    if (forecast.evidence_score < 45) {
+      guardrails.push("Independent evidence is thin; treat the estimate as fragile.");
+    }
+  }
+  $("edgeGuardrail").textContent = guardrails.length
+    ? guardrails.join(" ")
+    : "No audit guardrail is triggered, but this remains a historical estimate—not a promise.";
+  $("edgeGuardrail").dataset.state = guardrails.length ? "caution" : "clear";
 }
 
 function renderFingerprint(play) {
@@ -253,11 +391,35 @@ function renderRange(play) {
     row.append(key, result);
     return row;
   }));
+
+  $("horizonGrid").replaceChildren(...forecast.horizons.map((horizon) => {
+    const card = document.createElement("article");
+    card.dataset.direction = horizon.direction;
+    const label = document.createElement("span");
+    label.textContent = horizon.label;
+    const probability = document.createElement("strong");
+    probability.textContent = `${horizon.probability_up}% up`;
+    const detail = document.createElement("small");
+    detail.textContent =
+      `${pct(horizon.median_return)} typical · ` +
+      `${pct(horizon.low_return)} to ${pct(horizon.high_return)}`;
+    card.append(label, probability, detail);
+    return card;
+  }));
+  const conformal = play.validation?.conformal;
+  $("intervalNote").textContent = conformal?.available
+    ? `The endpoint range expands the raw 20th–80th percentile band by ` +
+      `${conformal.adjustment_points} points per side. It covered ` +
+      `${conformal.adjusted_coverage}% of untouched outcomes versus a ` +
+      `${conformal.target_coverage}% target.`
+    : "Preliminary ranges are raw matched-path percentiles until the coverage audit completes.";
 }
 
 function renderReliability(validation) {
   if (!validation.available) {
-    $("reliabilityGrade").textContent = "Not enough checks";
+    $("reliabilityGrade").textContent = validation.pending
+      ? "Audit loading"
+      : "Not enough checks";
     $("reliabilityGrade").dataset.grade = "limited";
     $("validationAccuracy").textContent = "—";
     $("validationAccuracyLabel").textContent = "Reliability is not established yet";
@@ -286,6 +448,246 @@ function renderReliability(validation) {
   $("validationNote").textContent = validation.explanation + actionable;
 }
 
+function renderAudit(validation) {
+  if (!validation.available) {
+    $("auditFrequency").textContent = validation.pending ? "Audit running" : "Unavailable";
+    [
+      "auditBrierSkill",
+      "auditSample",
+      "auditIndependent",
+      "auditBrier",
+      "auditCoverage",
+      "auditExpansion",
+    ]
+      .forEach((id) => { $(id).textContent = "—"; });
+    $("auditCoverageTarget").textContent = "Untouched forecasts";
+    $("auditPeriod").textContent = validation.reason || "No evaluation period";
+    $("calibrationList").replaceChildren();
+    $("strategySummary").replaceChildren();
+    $("strategyChart").replaceChildren();
+    $("strategyNote").textContent = validation.reason || "";
+    $("edgeStrataBody").replaceChildren();
+    $("regimeStrataBody").replaceChildren();
+    $("evaluationBody").replaceChildren();
+    return;
+  }
+
+  $("auditFrequency").textContent =
+    `Every ${validation.evaluation_frequency_sessions} sessions`;
+  $("auditBrierSkill").textContent =
+    `${validation.brier_skill >= 0 ? "+" : ""}${validation.brier_skill}%`;
+  $("auditBrierSkill").className = tone(validation.brier_skill);
+  $("auditSample").textContent = String(validation.sample_size);
+  $("auditIndependent").textContent = String(validation.independent_sample_size);
+  $("auditBrier").textContent =
+    `${Number(validation.brier).toFixed(3)} / ${Number(validation.baseline_brier).toFixed(3)}`;
+  $("auditPeriod").textContent =
+    `${formatDate(validation.evaluation_period.start)} – ${formatDate(validation.evaluation_period.end)}`;
+  const conformal = validation.conformal;
+  $("auditCoverage").textContent = conformal?.available
+    ? `${conformal.adjusted_coverage}%`
+    : "—";
+  $("auditCoverageTarget").textContent = conformal?.available
+    ? `${conformal.target_coverage}% target · ${conformal.raw_coverage}% raw`
+    : "Coverage unavailable";
+  $("auditExpansion").textContent = conformal?.available
+    ? `±${conformal.adjustment_points}`
+    : "—";
+
+  $("calibrationList").replaceChildren(...validation.calibration.map((bucket) => {
+    const row = document.createElement("div");
+    row.className = "calibration-row";
+    const heading = document.createElement("div");
+    const label = document.createElement("strong");
+    label.textContent = bucket.label;
+    const count = document.createElement("span");
+    count.textContent = `${bucket.count} checks`;
+    heading.append(label, count);
+    const bars = document.createElement("div");
+    bars.className = "calibration-bars";
+    const predicted = document.createElement("i");
+    predicted.style.width = `${bucket.predicted_up}%`;
+    predicted.title = `Predicted ${bucket.predicted_up}%`;
+    const observed = document.createElement("b");
+    observed.style.width = `${bucket.observed_up}%`;
+    observed.title = `Observed ${bucket.observed_up}%`;
+    bars.append(predicted, observed);
+    const values = document.createElement("small");
+    values.textContent =
+      `${bucket.predicted_up}% predicted · ${bucket.observed_up}% observed · ` +
+      `${bucket.gap_points >= 0 ? "+" : ""}${bucket.gap_points} pt gap`;
+    row.append(heading, bars, values);
+    return row;
+  }));
+
+  renderStrategyAudit(validation.strategy);
+  renderStrataTable("edgeStrataBody", validation.edge_strata, false);
+  renderStrataTable("regimeStrataBody", validation.regime_strata, true);
+  renderEvaluationRecords(validation.records);
+}
+
+function renderWaterfall(forecast) {
+  $("probabilityWaterfall").replaceChildren(...forecast.waterfall.map((step, index) => {
+    const row = document.createElement("div");
+    row.className = "waterfall-row";
+    const number = document.createElement("i");
+    number.textContent = String(index + 1).padStart(2, "0");
+    const body = document.createElement("div");
+    const heading = document.createElement("div");
+    const label = document.createElement("span");
+    const value = document.createElement("strong");
+    label.textContent = step.label;
+    value.textContent = `${step.value}%`;
+    heading.append(label, value);
+    const track = document.createElement("div");
+    const fill = document.createElement("b");
+    fill.style.width = `${Math.max(1, Math.min(99, step.value))}%`;
+    track.append(fill);
+    body.append(heading, track);
+    const delta = document.createElement("em");
+    delta.textContent = index
+      ? `${step.delta >= 0 ? "+" : ""}${step.delta} pts`
+      : "starting point";
+    delta.className = tone(step.delta);
+    row.append(number, body, delta);
+    return row;
+  }));
+}
+
+function renderAgreement(agreement) {
+  if (!agreement) return;
+  $("agreementLabel").textContent = agreement.label;
+  $("agreementScore").textContent = `${agreement.score}/100`;
+  $("agreementFill").style.width = `${agreement.score}%`;
+  $("agreementComponents").replaceChildren(...agreement.components.map((component) => {
+    const row = document.createElement("div");
+    row.dataset.state = component.state;
+    const stateIcon = document.createElement("i");
+    stateIcon.textContent = component.state === "bullish"
+      ? "↑" : component.state === "bearish" ? "↓" : "–";
+    const copy = document.createElement("span");
+    const label = document.createElement("strong");
+    const detail = document.createElement("small");
+    label.textContent = component.label;
+    detail.textContent = component.detail;
+    copy.append(label, detail);
+    row.append(stateIcon, copy);
+    return row;
+  }));
+}
+
+function renderStrategyAudit(strategy) {
+  if (!strategy?.available) {
+    $("strategySummary").replaceChildren();
+    $("strategyChart").replaceChildren();
+    $("strategyNote").textContent = "Not enough non-overlapping checkpoints.";
+    return;
+  }
+  const facts = [
+    ["Long/cash", pct(strategy.strategy_return)],
+    ["Buy and hold", pct(strategy.hold_return)],
+    ["Excess", pct(strategy.excess_return)],
+    ["Max drawdown", pct(strategy.max_drawdown)],
+    ["Long signals", `${strategy.trades} / ${strategy.periods}`],
+    ["Signal win rate", strategy.trade_win_rate === null ? "—" : `${strategy.trade_win_rate}%`],
+  ];
+  $("strategySummary").replaceChildren(...facts.map(([label, value]) => {
+    const item = document.createElement("div");
+    const key = document.createElement("span");
+    const result = document.createElement("strong");
+    key.textContent = label;
+    result.textContent = value;
+    item.append(key, result);
+    return item;
+  }));
+  $("strategyNote").textContent = strategy.note;
+  renderEquityChart(strategy);
+}
+
+function renderEquityChart(strategy) {
+  const svg = $("strategyChart");
+  const strategyValues = strategy.curve.map((point) => Number(point.value));
+  const holdValues = strategy.hold_curve.map((point) => Number(point.value));
+  const values = [...strategyValues, ...holdValues];
+  if (values.length < 2) {
+    svg.replaceChildren();
+    return;
+  }
+  const width = 560;
+  const height = 190;
+  const pad = 12;
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const spread = maximum - minimum || 1;
+  const x = (index, count) => pad + index / Math.max(1, count - 1) * (width - pad * 2);
+  const y = (value) => pad + (maximum - value) / spread * (height - pad * 2);
+  const path = (series) => series.map((value, index) =>
+    `${index ? "L" : "M"}${x(index, series.length).toFixed(1)},${y(value).toFixed(1)}`)
+    .join(" ");
+  svg.innerHTML = [
+    `<line class="strategy-baseline" x1="${pad}" x2="${width - pad}" y1="${y(100)}" y2="${y(100)}"></line>`,
+    `<path class="strategy-hold-line" d="${path(holdValues)}"></path>`,
+    `<path class="strategy-model-line" d="${path(strategyValues)}"></path>`,
+  ].join("");
+}
+
+function renderStrataTable(id, strata, showReturn) {
+  $(id).replaceChildren(...strata.map((item) => {
+    const row = document.createElement("tr");
+    const values = [
+      item.label,
+      item.count,
+      `${item.accuracy}%`,
+      showReturn ? pct(item.average_return) : Number(item.brier).toFixed(3),
+    ];
+    row.append(...values.map((value, index) => {
+      const cell = document.createElement(index === 0 ? "th" : "td");
+      cell.textContent = value;
+      return cell;
+    }));
+    return row;
+  }));
+}
+
+function renderEvaluationRecords(records) {
+  const latest = records.slice(-14).reverse();
+  $("evaluationBody").replaceChildren(...latest.map((record) => {
+    const row = document.createElement("tr");
+    const result = record.signal === "neutral"
+      ? "No call"
+      : record.signal_correct ? "Correct" : "Wrong";
+    const values = [
+      formatDate(record.date),
+      `${record.probability_up}%`,
+      `${record.edge_points >= 0 ? "+" : ""}${record.edge_points} pts`,
+      record.signal,
+      pct(record.actual_return),
+      result,
+    ];
+    row.append(...values.map((value, index) => {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      if (index === 5) {
+        cell.className = result === "Correct" ? "result-correct"
+          : result === "Wrong" ? "result-wrong" : "";
+      }
+      return cell;
+    }));
+    return row;
+  }));
+}
+
+function formatDate(value) {
+  const date = new Date(`${value}T12:00:00`);
+  return Number.isNaN(date.valueOf())
+    ? String(value || "—")
+    : date.toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+}
+
 function renderCatalyst(catalyst) {
   const warning = $("catalystWarning");
   warning.hidden = !catalyst?.near;
@@ -300,7 +702,10 @@ function renderUnavailable(play) {
   $("verdictExplanation").textContent = play.reason;
   $("horizonKicker").textContent = "One-month analog forecast";
   $("probabilityValue").textContent = "—";
+  $("probabilityRing").style.setProperty("--probability", "0deg");
   $("probabilityInterval").textContent = "No probability generated";
+  $("edgeState").textContent = "No forecast";
+  $("edgeState").dataset.state = "neutral";
   $("gaugeFill").style.width = "0%";
   $("confidenceLabel").textContent = "No evidence";
   ["analogProbability", "baselineProbability", "newsAdjustment", "analogEdge"]
@@ -314,7 +719,14 @@ function renderUnavailable(play) {
   ["rangeLow", "rangeTypical", "rangeHigh"].forEach((id) => { $(id).textContent = "—"; });
   $("rangeMedianMarker").style.left = "50%";
   $("evidenceFacts").replaceChildren();
+  $("horizonGrid").replaceChildren();
+  $("intervalNote").textContent = play.reason;
   renderReliability({ available: false, reason: play.reason });
+  renderAudit({ available: false, reason: play.reason });
+  $("probabilityWaterfall").replaceChildren();
+  $("agreementComponents").replaceChildren();
+  $("agreementScore").textContent = "—";
+  $("agreementFill").style.width = "0%";
   $("receiptsBody").replaceChildren();
   $("toggleReceipts").hidden = true;
   $("planRows").replaceChildren();
@@ -322,7 +734,161 @@ function renderUnavailable(play) {
   $("planNote").textContent = "A defensible risk plan requires historical analog evidence first.";
   $("planSizer").hidden = true;
   $("catalystWarning").hidden = true;
+  $("edgeGuardrail").textContent = play.reason;
+  $("edgeGuardrail").dataset.state = "caution";
   $("chartTooltip").hidden = true;
+  $("twinChips").replaceChildren();
+  $("twinContributions").replaceChildren();
+}
+
+function setTimeMachineBounds(data) {
+  if (!data.history.length) return;
+  const input = $("timeMachineDate");
+  const latest = data.history[data.history.length - 1].date;
+  input.max = latest;
+  if (!input.value || input.value >= latest) {
+    const defaultIndex = Math.max(0, data.history.length - 126);
+    input.value = data.history[defaultIndex].date;
+  }
+}
+
+async function loadTrackRecord(symbol) {
+  if (state.trackRequest) state.trackRequest.abort();
+  const controller = new AbortController();
+  state.trackRequest = controller;
+  try {
+    const response = await fetch(
+      `/api/track-record/${encodeURIComponent(symbol)}`,
+      { signal: controller.signal, headers: { Accept: "application/json" } },
+    );
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Track record unavailable.");
+    if (state.trackRequest !== controller || state.analysis?.symbol !== symbol) return;
+    renderTrackRecord(data);
+  } catch (error) {
+    if (error.name !== "AbortError" && state.trackRequest === controller) {
+      $("trackRecordEmpty").hidden = false;
+      $("trackRecordEmpty").textContent = error.message;
+    }
+  } finally {
+    if (state.trackRequest === controller) state.trackRequest = null;
+  }
+}
+
+function renderTrackRecord(data) {
+  const records = data.records || [];
+  $("trackRecordEmpty").hidden = records.length > 0;
+  if (!records.length) {
+    $("trackSummary").replaceChildren();
+    $("trackRecordList").replaceChildren();
+    return;
+  }
+  const summary = data.summary;
+  const facts = [
+    ["Stored", summary.total],
+    ["Graded", summary.graded],
+    ["Pending", summary.pending],
+    ["Directional accuracy", summary.directional_accuracy === null
+      ? "—" : `${summary.directional_accuracy}%`],
+  ];
+  $("trackSummary").replaceChildren(...facts.map(([label, value]) => {
+    const item = document.createElement("div");
+    const key = document.createElement("span");
+    const result = document.createElement("strong");
+    key.textContent = label;
+    result.textContent = value;
+    item.append(key, result);
+    return item;
+  }));
+  $("trackRecordList").replaceChildren(...records.slice(0, 8).map((record) => {
+    const row = document.createElement("article");
+    row.className = "track-record-row";
+    const call = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = `${formatDate(record.as_of_date)} · ${record.direction}`;
+    const detail = document.createElement("span");
+    detail.textContent =
+      `${record.probability_up}% up · ${record.edge_points >= 0 ? "+" : ""}${record.edge_points} pt edge`;
+    call.append(title, detail);
+    const outcome = document.createElement("div");
+    outcome.className = "track-outcome";
+    if (record.status === "graded") {
+      outcome.textContent = pct(record.realized_return);
+      outcome.dataset.result = record.direction_correct === true
+        ? "correct" : record.direction_correct === false ? "wrong" : "neutral";
+    } else {
+      outcome.textContent = `Due ${formatDate(record.horizon_date)}`;
+      outcome.dataset.result = "pending";
+    }
+    row.append(call, outcome);
+    return row;
+  }));
+}
+
+async function runTimeMachine(date) {
+  const symbol = state.analysis?.symbol;
+  if (!symbol) return;
+  if (state.timeRequest) state.timeRequest.abort();
+  const controller = new AbortController();
+  state.timeRequest = controller;
+  $("timeMachineStatus").textContent = "Rebuilding the fingerprint with later rows sealed off…";
+  $("timeMachineResult").hidden = true;
+  try {
+    const url =
+      `/api/analyze/${encodeURIComponent(symbol)}/as-of?date=${encodeURIComponent(date)}`;
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Time Machine could not run.");
+    if (state.timeRequest !== controller) return;
+    renderTimeMachine(data);
+    $("timeMachineStatus").textContent =
+      `Forecast rebuilt at ${formatDate(data.time_machine.session_date)} with no future rows.`;
+  } catch (error) {
+    if (error.name !== "AbortError" && state.timeRequest === controller) {
+      $("timeMachineStatus").textContent = error.message;
+    }
+  } finally {
+    if (state.timeRequest === controller) state.timeRequest = null;
+  }
+}
+
+function renderTimeMachine(data) {
+  const box = $("timeMachineResult");
+  const play = data.playbook;
+  if (!play.available) {
+    box.textContent = play.reason;
+    box.hidden = false;
+    return;
+  }
+  const outcome = data.time_machine.outcome;
+  const forecast = document.createElement("div");
+  forecast.className = "time-machine-call";
+  const probability = document.createElement("strong");
+  probability.textContent = `${play.forecast.probability_up}%`;
+  const copy = document.createElement("span");
+  copy.textContent =
+    `${play.verdict.headline} · ${play.forecast.edge_points >= 0 ? "+" : ""}` +
+    `${play.forecast.edge_points} point analog edge`;
+  forecast.append(probability, copy);
+  const realized = document.createElement("div");
+  realized.className = "time-machine-outcome";
+  if (outcome.available) {
+    realized.dataset.result = outcome.direction_correct === true
+      ? "correct" : outcome.direction_correct === false ? "wrong" : "neutral";
+    realized.textContent =
+      `What happened by ${formatDate(outcome.date)}: ${pct(outcome.realized_return)} · ` +
+      `${outcome.direction_correct === true ? "direction correct"
+        : outcome.direction_correct === false ? "direction wrong" : "no directional call"}`;
+  } else {
+    realized.textContent = outcome.reason;
+  }
+  const seal = document.createElement("small");
+  seal.textContent = "Forecast input cutoff verified · historical news excluded";
+  box.replaceChildren(forecast, realized, seal);
+  box.hidden = false;
 }
 
 function renderStory(story) {
@@ -365,6 +931,21 @@ function renderReceipts(play) {
       cell(pct(match.max_upside), "pct up"),
       cell(pct(match.fwd_21d), `pct ${match.fwd_21d > 0 ? "up" : match.fwd_21d < 0 ? "down" : ""}`),
     );
+    if (play.ghost_paths.some((path) => path.date === match.date)) {
+      row.classList.add("interactive-receipt");
+      if (match.date === state.selectedTwin) {
+        row.classList.add("selected-receipt");
+        row.setAttribute("aria-selected", "true");
+      }
+      row.tabIndex = 0;
+      row.addEventListener("click", () => selectTwin(match.date));
+      row.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          selectTwin(match.date);
+        }
+      });
+    }
     return row;
   });
   $("receiptsBody").replaceChildren(...rows);
@@ -372,6 +953,68 @@ function renderReceipts(play) {
     ? "Show closest eight"
     : `Inspect all ${play.matches.length} twins`;
   $("toggleReceipts").hidden = play.matches.length <= 8;
+}
+
+function renderTwinExplorer(play) {
+  const paths = play.ghost_paths || [];
+  if (!paths.length) {
+    $("twinChips").replaceChildren();
+    $("twinContributions").replaceChildren();
+    return;
+  }
+  if (!paths.some((path) => path.date === state.selectedTwin)) {
+    state.selectedTwin = paths[0].date;
+  }
+  $("twinChips").replaceChildren(...paths.map((path) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.active = String(path.date === state.selectedTwin);
+    button.textContent = `${formatDate(path.date)} · ${path.quality}`;
+    button.addEventListener("click", () => selectTwin(path.date));
+    return button;
+  }));
+  renderTwinContributions(play, state.selectedTwin);
+}
+
+function selectTwin(date) {
+  if (!state.analysis?.playbook.available) return;
+  state.selectedTwin = date;
+  renderTwinExplorer(state.analysis.playbook);
+  renderReceipts(state.analysis.playbook);
+  renderChart();
+}
+
+function renderTwinContributions(play, date) {
+  const match = play.matches.find((item) => item.date === date);
+  if (!match) {
+    $("twinContributions").replaceChildren();
+    return;
+  }
+  const heading = document.createElement("div");
+  heading.className = "twin-contribution-heading";
+  const title = document.createElement("strong");
+  title.textContent = `${formatDate(match.date)} · ${match.quality}/100 match`;
+  const outcome = document.createElement("span");
+  outcome.textContent =
+    `Then: ${pct(match.fwd_5d)} after 5 · ${pct(match.fwd_10d)} after 10 · ` +
+    `${pct(match.fwd_21d)} at the horizon`;
+  heading.append(title, outcome);
+  const signals = document.createElement("div");
+  signals.className = "twin-signal-grid";
+  signals.append(...match.contributions.map((item) => {
+    const card = document.createElement("div");
+    const label = document.createElement("span");
+    const score = document.createElement("strong");
+    const track = document.createElement("i");
+    const fill = document.createElement("b");
+    label.textContent = item.label;
+    score.textContent = `${item.closeness}% close`;
+    fill.style.width = `${item.closeness}%`;
+    track.append(fill);
+    card.append(label, score, track);
+    return card;
+  }));
+  $("twinContributions").replaceChildren(heading, signals);
 }
 
 function planRow(icon, key, value, detail, kind) {
@@ -511,8 +1154,10 @@ function renderChart() {
   const projectionDays = play.available ? play.forecast.horizon_days : 0;
   const totalSteps = history.length - 1 + projectionDays;
   const ghosts = play.available
-    ? play.ghost_paths.map((path) =>
-      path.offsets.map((offset) => currentPrice * (1 + offset / 100)))
+    ? play.ghost_paths.map((path) => ({
+      date: path.date,
+      values: path.offsets.map((offset) => currentPrice * (1 + offset / 100)),
+    }))
     : [];
   const projection = play.available ? play.projection : null;
   const coneLower = projection
@@ -528,7 +1173,7 @@ function renderChart() {
 
   const values = [
     ...history.map((point) => point.close),
-    ...ghosts.flat(),
+    ...ghosts.flatMap((path) => path.values),
     ...coneLower,
     ...coneUpper,
     ...(plan?.target ? [plan.target] : []),
@@ -566,7 +1211,13 @@ function renderChart() {
   }
 
   ghosts.forEach((path) => {
-    parts.push(`<path class="chart-ghost" d="${linePath(path, history.length - 1)}"></path>`);
+    const selected = path.date === state.selectedTwin;
+    const className = state.selectedTwin
+      ? `chart-ghost ${selected ? "selected" : "dimmed"}`
+      : "chart-ghost";
+    parts.push(
+      `<path class="${className}" d="${linePath(path.values, history.length - 1)}"></path>`,
+    );
   });
   if (coneMedian.length > 1) {
     parts.push(`<path class="chart-median" d="${linePath(coneMedian, history.length - 1)}"></path>`);
@@ -632,6 +1283,33 @@ function updateWatchButton() {
   renderWatchlist();
 }
 
+function insightFromAnalysis(data) {
+  if (!data?.playbook?.available) return null;
+  return {
+    symbol: data.symbol,
+    price: data.quote.price,
+    currency: data.currency,
+    direction: data.playbook.verdict.direction,
+    probability_up: data.playbook.forecast.probability_up,
+    edge_points: data.playbook.forecast.edge_points,
+    typical_return: data.playbook.forecast.range_21d.typical,
+    evidence_score: data.playbook.forecast.evidence_score,
+    stage: data.stage,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function rememberWatchInsight(data) {
+  const insight = insightFromAnalysis(data);
+  if (!insight) return;
+  state.watchData[data.symbol] = insight;
+  const retained = new Set([data.symbol, ...state.watchlist]);
+  Object.keys(state.watchData).forEach((symbol) => {
+    if (!retained.has(symbol)) delete state.watchData[symbol];
+  });
+  saveWatchInsights();
+}
+
 function renderWatchlist() {
   $("watchlistEmpty").hidden = state.watchlist.length > 0;
   $("watchlist").replaceChildren(...state.watchlist.map((symbol) => {
@@ -640,7 +1318,16 @@ function renderWatchlist() {
     const open = document.createElement("button");
     open.type = "button";
     open.className = "open-symbol";
-    open.textContent = symbol;
+    const name = document.createElement("strong");
+    name.textContent = symbol;
+    const insight = state.watchData[symbol];
+    const detail = document.createElement("span");
+    detail.textContent = insight
+      ? `${insight.probability_up}% up · ` +
+        `${insight.edge_points >= 0 ? "+" : ""}${insight.edge_points} pt edge · ` +
+        `${insight.direction}`
+      : "Not scanned yet";
+    open.append(name, detail);
     open.addEventListener("click", () => loadSymbol(symbol));
     const remove = document.createElement("button");
     remove.type = "button";
@@ -649,12 +1336,98 @@ function renderWatchlist() {
     remove.textContent = "×";
     remove.addEventListener("click", () => {
       state.watchlist = state.watchlist.filter((item) => item !== symbol);
+      delete state.watchData[symbol];
       saveWatchlist();
+      saveWatchInsights();
       updateWatchButton();
     });
     row.append(open, remove);
     return row;
   }));
+}
+
+function updateRoute(symbol, view = "forecast", hash = "") {
+  state.activeView = view;
+  const route = view === "audit" ? "audit" : "forecast";
+  const path = `/${route}/${encodeURIComponent(symbol)}${hash}`;
+  window.history.replaceState({}, "", path);
+  setActiveNav(view);
+}
+
+function setActiveNav(section) {
+  document.querySelectorAll("#sectionNav [data-section]").forEach((link) => {
+    link.dataset.active = String(link.dataset.section === section);
+  });
+}
+
+async function shareCurrentView() {
+  const button = $("shareView");
+  try {
+    await navigator.clipboard.writeText(window.location.href);
+    button.textContent = "Link copied";
+  } catch {
+    const field = document.createElement("textarea");
+    field.value = window.location.href;
+    field.setAttribute("readonly", "");
+    field.style.position = "fixed";
+    field.style.opacity = "0";
+    document.body.append(field);
+    field.select();
+    document.execCommand("copy");
+    field.remove();
+    button.textContent = "Link copied";
+  }
+  window.setTimeout(() => { button.textContent = "Share this view"; }, 1800);
+}
+
+async function refreshWatchlist() {
+  if (!state.watchlist.length) {
+    $("watchlistStatus").textContent = "Watch at least one symbol before running a scan.";
+    return;
+  }
+  if (state.watchRefresh) state.watchRefresh.abort();
+  const controller = new AbortController();
+  state.watchRefresh = controller;
+  $("refreshWatchlist").disabled = true;
+  const symbols = [...state.watchlist];
+  let completed = 0;
+  try {
+    for (let index = 0; index < symbols.length; index += 1) {
+      const symbol = symbols[index];
+      $("watchlistStatus").textContent =
+        `Quick-scanning ${symbol} · ${index + 1} of ${symbols.length}`;
+      const response = await fetch(
+        `/api/analyze/${encodeURIComponent(symbol)}/quick`,
+        {
+          signal: controller.signal,
+          headers: { Accept: "application/json" },
+        },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || `${symbol} could not be scanned.`);
+      }
+      const insight = insightFromAnalysis(data);
+      if (insight && state.watchlist.includes(symbol)) {
+        state.watchData[symbol] = insight;
+        saveWatchInsights();
+        completed += 1;
+      }
+      renderWatchlist();
+    }
+    $("watchlistStatus").textContent =
+      `Compared ${completed} watched setup` +
+      `${completed === 1 ? "" : "s"} with preliminary balanced weights.`;
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      $("watchlistStatus").textContent = error.message;
+    }
+  } finally {
+    if (state.watchRefresh === controller) {
+      state.watchRefresh = null;
+      $("refreshWatchlist").disabled = false;
+    }
+  }
 }
 
 $("symbolForm").addEventListener("submit", (event) => {
@@ -684,6 +1457,26 @@ $("toggleReceipts").addEventListener("click", () => {
 });
 
 $("investAmount").addEventListener("input", updateSizer);
+$("refreshWatchlist").addEventListener("click", refreshWatchlist);
+$("shareView").addEventListener("click", shareCurrentView);
+document.querySelectorAll("#sectionNav [data-section]").forEach((link) => {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    const section = link.dataset.section;
+    const target = document.querySelector(link.getAttribute("href"));
+    if (!target || !state.analysis) return;
+    const view = section === "audit" || section === "track"
+      ? "audit" : "forecast";
+    const hash = link.getAttribute("href");
+    updateRoute(state.analysis.symbol, view, hash);
+    setActiveNav(section);
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+});
+$("timeMachineForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  runTimeMachine($("timeMachineDate").value);
+});
 $("themeToggle").addEventListener("click", () => {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
@@ -695,6 +1488,22 @@ const savedTheme = storageGet("playbook-theme")
 document.documentElement.dataset.theme = savedTheme;
 renderWatchlist();
 
-const initialSymbol = new URLSearchParams(window.location.search).get("symbol")
-  || storageGet("playbook-last-symbol");
-if (initialSymbol) loadSymbol(initialSymbol);
+const routeError = document.body.dataset.routeError;
+const initialSymbol = document.body.dataset.initialSymbol
+  || (
+    routeError
+      ? null
+      : new URLSearchParams(window.location.search).get("symbol")
+        || storageGet("playbook-last-symbol")
+  );
+if (routeError) {
+  $("statusMessage").textContent = routeError === "invalid_symbol"
+    ? "That shared market symbol is invalid. Enter a valid symbol below."
+    : "That Playbook page does not exist. Start with a market symbol below.";
+}
+if (initialSymbol) {
+  loadSymbol(initialSymbol, {
+    view: document.body.dataset.initialView || "forecast",
+    initial: true,
+  });
+}

@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   <script defer src="{{ url_for('static', filename='app.js') }}"></script>
 </head>
-<body>
+<body data-initial-symbol="{{ initial_symbol|default('') }}" data-initial-view="{{ initial_view|default('forecast') }}" data-route-error="{{ route_error|default('') }}">
   <header class="site-header">
     <a class="brand" href="/">
       <span class="brand-mark" aria-hidden="true">⟲</span>
@@ -19,6 +19,17 @@
       <button class="icon-button" id="themeToggle" type="button" aria-label="Switch color theme">◐</button>
     </div>
   </header>
+
+  <nav class="section-nav" id="sectionNav" aria-label="Playbook sections" hidden>
+    <div>
+      <strong id="navSymbol">Playbook</strong>
+      <a href="#verdictCard" data-section="forecast">Forecast</a>
+      <a href="#chartPanel" data-section="twins">Twins</a>
+      <a href="#auditCenter" data-section="audit">Audit</a>
+      <a href="#trackRecordPanel" data-section="track">Track record</a>
+      <button id="shareView" type="button">Share this view</button>
+    </div>
+  </nav>
 
   <main>
     <section class="hero" id="hero">
@@ -45,14 +56,39 @@
       </div>
     </section>
 
+    <section class="landing-proof" id="landingProof">
+      <div class="landing-proof-heading">
+        <span class="eyebrow">A forecast should leave receipts</span>
+        <h2>Playbook is built to be challenged, not believed.</h2>
+        <p>Before a probability is finalized, the same matching method is frozen, replayed on later unseen dates, calibrated on an older period, and compared with doing nothing clever.</p>
+      </div>
+      <div class="proof-demo">
+        <article>
+          <span>01 · Seal the date</span>
+          <strong>No future rows</strong>
+          <p>Time Machine reconstructs any past setup using only information available after that session closed.</p>
+        </article>
+        <article>
+          <span>02 · Grade every five sessions</span>
+          <strong>Dense holdout audit</strong>
+          <p>Calibration, Brier skill, regimes, and interval coverage stay visible—even when results disappoint.</p>
+        </article>
+        <article>
+          <span>03 · Lock live calls</span>
+          <strong>An immutable ledger</strong>
+          <p>Completed-session forecasts are stored once and graded only after the exact future-session horizon matures.</p>
+        </article>
+      </div>
+    </section>
+
     <p class="status-message" id="statusMessage" role="status" aria-live="polite"></p>
     <div class="loading-strip" id="loadingStrip" hidden>
-      <div class="loading-bar"></div>
+      <div class="loading-track"><div class="loading-bar" id="loadingBar"></div></div>
       <p id="loadingText">Building today’s market fingerprint…</p>
     </div>
 
     <section class="workspace" id="workspace" hidden>
-      <section class="verdict-card forecast-card" id="verdictCard">
+      <section class="verdict-card forecast-card reveal-section" id="verdictCard">
         <div class="verdict-top">
           <div class="asset-line">
             <span class="asset-symbol" id="assetSymbol">—</span>
@@ -79,14 +115,19 @@
           </div>
 
           <div class="probability-block">
-            <span class="probability-label">Chance of finishing higher</span>
-            <strong class="probability-value" id="probabilityValue">—</strong>
+            <div class="probability-ring" id="probabilityRing">
+              <div>
+                <span class="probability-label">Chance of finishing higher</span>
+                <strong class="probability-value" id="probabilityValue">—</strong>
+              </div>
+            </div>
             <span class="probability-interval" id="probabilityInterval">—</span>
+            <span class="edge-state" id="edgeState">Waiting for evidence</span>
             <div class="gauge-track"><div class="gauge-fill" id="gaugeFill"></div></div>
             <div class="gauge-labels">
-              <span>Thin evidence</span>
+              <span>Evidence quality</span>
               <span id="confidenceLabel">—</span>
-              <span>Strong evidence</span>
+              <span>95 max</span>
             </div>
           </div>
         </div>
@@ -119,9 +160,10 @@
           <p id="storySummary"></p>
         </div>
         <div class="catalyst-warning" id="catalystWarning" hidden></div>
+        <div class="edge-guardrail" id="edgeGuardrail"></div>
       </section>
 
-      <section class="panel fingerprint-panel">
+      <section class="panel fingerprint-panel reveal-section">
         <div class="panel-heading">
           <div>
             <span class="section-number">01 · FINGERPRINT TODAY</span>
@@ -134,7 +176,7 @@
         <div class="matching-strip" id="matchingStrip"></div>
       </section>
 
-      <section class="panel chart-panel">
+      <section class="panel chart-panel reveal-section" id="chartPanel">
         <div class="panel-heading">
           <div>
             <span class="section-number">02 · REPLAY THE TWINS</span>
@@ -154,9 +196,17 @@
           <span><i class="swatch swatch-target"></i> Path-derived target</span>
           <span><i class="swatch swatch-stop"></i> Path-derived stop</span>
         </div>
+        <div class="twin-explorer">
+          <div>
+            <strong>Inspect one historical twin</strong>
+            <span>Highlight its future path and see which signals made it feel familiar.</span>
+          </div>
+          <div class="twin-chips" id="twinChips"></div>
+          <div class="twin-contributions" id="twinContributions"></div>
+        </div>
       </section>
 
-      <div class="two-column evidence-columns">
+      <div class="two-column evidence-columns reveal-section">
         <section class="panel range-panel">
           <div class="panel-heading">
             <div>
@@ -172,6 +222,8 @@
             <div class="range-point high"><span>Stronger path</span><strong id="rangeHigh">—</strong></div>
           </div>
           <div class="evidence-facts" id="evidenceFacts"></div>
+          <div class="horizon-grid" id="horizonGrid"></div>
+          <p class="interval-note" id="intervalNote"></p>
         </section>
 
         <section class="panel reliability-panel" id="reliabilityPanel">
@@ -195,10 +247,87 @@
         </section>
       </div>
 
-      <section class="panel receipts-panel">
+      <div class="two-column forecast-explainers reveal-section">
+        <section class="panel waterfall-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">WHY THIS PROBABILITY</span>
+              <h3>From normal odds to today’s estimate</h3>
+              <p class="panel-sub">Every step is visible: the asset’s base rate, raw twins, statistical shrinkage, then bounded current news.</p>
+            </div>
+          </div>
+          <div class="probability-waterfall" id="probabilityWaterfall"></div>
+        </section>
+        <section class="panel agreement-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">EVIDENCE AGREEMENT</span>
+              <h3 id="agreementLabel">Do the signals tell one story?</h3>
+              <p class="panel-sub">Agreement is descriptive, not extra probability. It shows whether path votes, the typical finish, and current headlines point together.</p>
+            </div>
+            <strong class="agreement-score" id="agreementScore">—</strong>
+          </div>
+          <div class="agreement-track"><i id="agreementFill"></i></div>
+          <div class="agreement-components" id="agreementComponents"></div>
+        </section>
+      </div>
+
+      <section class="panel audit-center reveal-section" id="auditCenter">
         <div class="panel-heading">
           <div>
-            <span class="section-number">05 · INSPECT THE EVIDENCE</span>
+            <span class="section-number">05 · OPEN THE AUDIT</span>
+            <h3>Every untouched checkpoint, not just one accuracy number</h3>
+            <p class="panel-sub">Five-session evaluation records reveal calibration, where the edge held up, and what a non-overlapping long-or-cash policy would have done.</p>
+          </div>
+          <span class="profile-pill" id="auditFrequency">—</span>
+        </div>
+        <div class="audit-metrics">
+          <div><span>Brier skill vs baseline</span><strong id="auditBrierSkill">—</strong><small>Higher is better</small></div>
+          <div><span>Untouched forecasts</span><strong id="auditSample">—</strong><small id="auditPeriod">—</small></div>
+          <div><span>Independent checks</span><strong id="auditIndependent">—</strong><small>Used for the 95% range</small></div>
+          <div><span>Model / baseline Brier</span><strong id="auditBrier">—</strong><small>Lower is better</small></div>
+          <div><span>Conformal coverage</span><strong id="auditCoverage">—</strong><small id="auditCoverageTarget">Untouched forecasts</small></div>
+          <div><span>Interval expansion</span><strong id="auditExpansion">—</strong><small>Percentage points per side</small></div>
+        </div>
+        <div class="audit-grid">
+          <div class="audit-block">
+            <h4>Calibration: predicted versus observed</h4>
+            <p>Good probabilities should land near the diagonal, not merely sound confident.</p>
+            <div class="calibration-list" id="calibrationList"></div>
+          </div>
+          <div class="audit-block">
+            <h4>Strategy reality check</h4>
+            <p>Non-overlapping long-or-cash checkpoint windows, before costs.</p>
+            <div class="strategy-summary" id="strategySummary"></div>
+            <svg class="strategy-chart" id="strategyChart" viewBox="0 0 560 190" preserveAspectRatio="none" role="img" aria-label="Historical strategy and buy-and-hold equity curves"></svg>
+            <p class="audit-note" id="strategyNote"></p>
+          </div>
+        </div>
+        <div class="audit-grid audit-breakdowns">
+          <div class="audit-block">
+            <h4>Reliability by analog edge</h4>
+            <div class="audit-table-wrap"><table class="audit-table"><thead><tr><th>Edge</th><th>Checks</th><th>Accuracy</th><th>Brier</th></tr></thead><tbody id="edgeStrataBody"></tbody></table></div>
+          </div>
+          <div class="audit-block">
+            <h4>Reliability by market regime</h4>
+            <div class="audit-table-wrap"><table class="audit-table"><thead><tr><th>Regime</th><th>Checks</th><th>Accuracy</th><th>Avg return</th></tr></thead><tbody id="regimeStrataBody"></tbody></table></div>
+          </div>
+        </div>
+        <details class="evaluation-log">
+          <summary>Inspect the latest untouched evaluation records</summary>
+          <div class="audit-table-wrap">
+            <table class="audit-table evaluation-table">
+              <thead><tr><th>Forecast date</th><th>Odds up</th><th>Edge</th><th>Call</th><th>Actual</th><th>Result</th></tr></thead>
+              <tbody id="evaluationBody"></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
+
+      <section class="panel receipts-panel reveal-section">
+        <div class="panel-heading">
+          <div>
+            <span class="section-number">06 · INSPECT THE EVIDENCE</span>
             <h3>The historical twins</h3>
             <p class="panel-sub">Every row is a real, independent setup. Match quality is a distance score—not a probability.</p>
           </div>
@@ -221,7 +350,41 @@
         </div>
       </section>
 
-      <div class="two-column">
+      <div class="two-column proof-tools reveal-section">
+        <section class="panel time-machine-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">PROVE IT · TIME MACHINE</span>
+              <h3>Rebuild the forecast on a past date</h3>
+              <p class="panel-sub">Playbook cuts off every price and context row after that session, then reveals the outcome only after the forecast is complete.</p>
+            </div>
+          </div>
+          <form class="time-machine-form" id="timeMachineForm">
+            <label for="timeMachineDate">Historical date</label>
+            <div>
+              <input id="timeMachineDate" type="date" required>
+              <button type="submit">Run without hindsight</button>
+            </div>
+          </form>
+          <p class="tool-status" id="timeMachineStatus"></p>
+          <div class="time-machine-result" id="timeMachineResult" hidden></div>
+        </section>
+
+        <section class="panel track-record-panel" id="trackRecordPanel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">PROVE IT · LIVE TRACK RECORD</span>
+              <h3>Forecasts Playbook can no longer edit</h3>
+              <p class="panel-sub">One audited forecast per completed session. Outcomes are graded only after the full horizon matures.</p>
+            </div>
+          </div>
+          <div class="track-summary" id="trackSummary"></div>
+          <div class="track-record-list" id="trackRecordList"></div>
+          <p class="empty-note" id="trackRecordEmpty">The first audited forecast for this symbol will appear here.</p>
+        </section>
+      </div>
+
+      <div class="two-column reveal-section">
         <section class="panel plan-panel">
           <div class="panel-heading">
             <div>
@@ -251,12 +414,13 @@
         </section>
       </div>
 
-      <section class="panel watchlist-panel">
+      <section class="panel watchlist-panel reveal-section">
         <div class="panel-heading">
           <div>
             <h3>Your watched setups</h3>
-            <p class="panel-sub">Saved in this browser only.</p>
+            <p class="panel-sub" id="watchlistStatus">Saved in this browser only. Audited symbols retain their latest comparison snapshot.</p>
           </div>
+          <button class="toggle-receipts" id="refreshWatchlist" type="button">Quick-scan watched</button>
         </div>
         <div class="watchlist" id="watchlist"></div>
         <p class="empty-note" id="watchlistEmpty">Star a symbol to keep it here.</p>
