@@ -3,8 +3,11 @@ const state = {
   request: null,
   trackRequest: null,
   timeRequest: null,
+  watchRefresh: null,
+  selectedTwin: null,
   showAllReceipts: false,
   watchlist: readStoredList(),
+  watchData: readStoredInsights(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -46,8 +49,23 @@ function readStoredList() {
   }
 }
 
+function readStoredInsights() {
+  try {
+    const value = JSON.parse(storageGet("playbook-watch-data") || "{}");
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 function saveWatchlist() {
   storageSet("playbook-watchlist", JSON.stringify(state.watchlist));
+}
+
+function saveWatchInsights() {
+  storageSet("playbook-watch-data", JSON.stringify(state.watchData));
 }
 
 function startLoading() {
@@ -80,6 +98,7 @@ async function loadSymbol(rawSymbol) {
   if (state.timeRequest) state.timeRequest.abort();
   const controller = new AbortController();
   state.request = controller;
+  state.selectedTwin = null;
   $("statusMessage").textContent = "";
   $("symbolInput").value = symbol;
   $("trackSummary").replaceChildren();
@@ -160,7 +179,10 @@ function render(data) {
     renderRange(play);
     renderReliability(play.validation);
     renderAudit(play.validation);
+    renderWaterfall(play.forecast);
+    renderAgreement(play.forecast.agreement);
     renderReceipts(play);
+    renderTwinExplorer(play);
     renderPlan(data);
     renderCatalyst(play.catalyst);
   } else {
@@ -171,6 +193,7 @@ function render(data) {
   renderNews(data);
   renderChart();
   setTimeMachineBounds(data);
+  rememberWatchInsight(data);
   updateWatchButton();
   const warnings = data.warnings.length
     ? ` Data notes: ${data.warnings.join(" ")}`
@@ -279,6 +302,28 @@ function renderRange(play) {
     row.append(key, result);
     return row;
   }));
+
+  $("horizonGrid").replaceChildren(...forecast.horizons.map((horizon) => {
+    const card = document.createElement("article");
+    card.dataset.direction = horizon.direction;
+    const label = document.createElement("span");
+    label.textContent = horizon.label;
+    const probability = document.createElement("strong");
+    probability.textContent = `${horizon.probability_up}% up`;
+    const detail = document.createElement("small");
+    detail.textContent =
+      `${pct(horizon.median_return)} typical · ` +
+      `${pct(horizon.low_return)} to ${pct(horizon.high_return)}`;
+    card.append(label, probability, detail);
+    return card;
+  }));
+  const conformal = play.validation?.conformal;
+  $("intervalNote").textContent = conformal?.available
+    ? `The endpoint range expands the raw 20th–80th percentile band by ` +
+      `${conformal.adjustment_points} points per side. It covered ` +
+      `${conformal.adjusted_coverage}% of untouched outcomes versus a ` +
+      `${conformal.target_coverage}% target.`
+    : "Preliminary ranges are raw matched-path percentiles until the coverage audit completes.";
 }
 
 function renderReliability(validation) {
@@ -317,8 +362,16 @@ function renderReliability(validation) {
 function renderAudit(validation) {
   if (!validation.available) {
     $("auditFrequency").textContent = validation.pending ? "Audit running" : "Unavailable";
-    ["auditBrierSkill", "auditSample", "auditIndependent", "auditBrier"]
+    [
+      "auditBrierSkill",
+      "auditSample",
+      "auditIndependent",
+      "auditBrier",
+      "auditCoverage",
+      "auditExpansion",
+    ]
       .forEach((id) => { $(id).textContent = "—"; });
+    $("auditCoverageTarget").textContent = "Untouched forecasts";
     $("auditPeriod").textContent = validation.reason || "No evaluation period";
     $("calibrationList").replaceChildren();
     $("strategySummary").replaceChildren();
@@ -341,6 +394,16 @@ function renderAudit(validation) {
     `${Number(validation.brier).toFixed(3)} / ${Number(validation.baseline_brier).toFixed(3)}`;
   $("auditPeriod").textContent =
     `${formatDate(validation.evaluation_period.start)} – ${formatDate(validation.evaluation_period.end)}`;
+  const conformal = validation.conformal;
+  $("auditCoverage").textContent = conformal?.available
+    ? `${conformal.adjusted_coverage}%`
+    : "—";
+  $("auditCoverageTarget").textContent = conformal?.available
+    ? `${conformal.target_coverage}% target · ${conformal.raw_coverage}% raw`
+    : "Coverage unavailable";
+  $("auditExpansion").textContent = conformal?.available
+    ? `±${conformal.adjustment_points}`
+    : "—";
 
   $("calibrationList").replaceChildren(...validation.calibration.map((bucket) => {
     const row = document.createElement("div");
@@ -372,6 +435,56 @@ function renderAudit(validation) {
   renderStrataTable("edgeStrataBody", validation.edge_strata, false);
   renderStrataTable("regimeStrataBody", validation.regime_strata, true);
   renderEvaluationRecords(validation.records);
+}
+
+function renderWaterfall(forecast) {
+  $("probabilityWaterfall").replaceChildren(...forecast.waterfall.map((step, index) => {
+    const row = document.createElement("div");
+    row.className = "waterfall-row";
+    const number = document.createElement("i");
+    number.textContent = String(index + 1).padStart(2, "0");
+    const body = document.createElement("div");
+    const heading = document.createElement("div");
+    const label = document.createElement("span");
+    const value = document.createElement("strong");
+    label.textContent = step.label;
+    value.textContent = `${step.value}%`;
+    heading.append(label, value);
+    const track = document.createElement("div");
+    const fill = document.createElement("b");
+    fill.style.width = `${Math.max(1, Math.min(99, step.value))}%`;
+    track.append(fill);
+    body.append(heading, track);
+    const delta = document.createElement("em");
+    delta.textContent = index
+      ? `${step.delta >= 0 ? "+" : ""}${step.delta} pts`
+      : "starting point";
+    delta.className = tone(step.delta);
+    row.append(number, body, delta);
+    return row;
+  }));
+}
+
+function renderAgreement(agreement) {
+  if (!agreement) return;
+  $("agreementLabel").textContent = agreement.label;
+  $("agreementScore").textContent = `${agreement.score}/100`;
+  $("agreementFill").style.width = `${agreement.score}%`;
+  $("agreementComponents").replaceChildren(...agreement.components.map((component) => {
+    const row = document.createElement("div");
+    row.dataset.state = component.state;
+    const stateIcon = document.createElement("i");
+    stateIcon.textContent = component.state === "bullish"
+      ? "↑" : component.state === "bearish" ? "↓" : "–";
+    const copy = document.createElement("span");
+    const label = document.createElement("strong");
+    const detail = document.createElement("small");
+    label.textContent = component.label;
+    detail.textContent = component.detail;
+    copy.append(label, detail);
+    row.append(stateIcon, copy);
+    return row;
+  }));
 }
 
 function renderStrategyAudit(strategy) {
@@ -514,8 +627,14 @@ function renderUnavailable(play) {
   ["rangeLow", "rangeTypical", "rangeHigh"].forEach((id) => { $(id).textContent = "—"; });
   $("rangeMedianMarker").style.left = "50%";
   $("evidenceFacts").replaceChildren();
+  $("horizonGrid").replaceChildren();
+  $("intervalNote").textContent = play.reason;
   renderReliability({ available: false, reason: play.reason });
   renderAudit({ available: false, reason: play.reason });
+  $("probabilityWaterfall").replaceChildren();
+  $("agreementComponents").replaceChildren();
+  $("agreementScore").textContent = "—";
+  $("agreementFill").style.width = "0%";
   $("receiptsBody").replaceChildren();
   $("toggleReceipts").hidden = true;
   $("planRows").replaceChildren();
@@ -524,6 +643,8 @@ function renderUnavailable(play) {
   $("planSizer").hidden = true;
   $("catalystWarning").hidden = true;
   $("chartTooltip").hidden = true;
+  $("twinChips").replaceChildren();
+  $("twinContributions").replaceChildren();
 }
 
 function setTimeMachineBounds(data) {
@@ -716,6 +837,21 @@ function renderReceipts(play) {
       cell(pct(match.max_upside), "pct up"),
       cell(pct(match.fwd_21d), `pct ${match.fwd_21d > 0 ? "up" : match.fwd_21d < 0 ? "down" : ""}`),
     );
+    if (play.ghost_paths.some((path) => path.date === match.date)) {
+      row.classList.add("interactive-receipt");
+      if (match.date === state.selectedTwin) {
+        row.classList.add("selected-receipt");
+        row.setAttribute("aria-selected", "true");
+      }
+      row.tabIndex = 0;
+      row.addEventListener("click", () => selectTwin(match.date));
+      row.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          selectTwin(match.date);
+        }
+      });
+    }
     return row;
   });
   $("receiptsBody").replaceChildren(...rows);
@@ -723,6 +859,68 @@ function renderReceipts(play) {
     ? "Show closest eight"
     : `Inspect all ${play.matches.length} twins`;
   $("toggleReceipts").hidden = play.matches.length <= 8;
+}
+
+function renderTwinExplorer(play) {
+  const paths = play.ghost_paths || [];
+  if (!paths.length) {
+    $("twinChips").replaceChildren();
+    $("twinContributions").replaceChildren();
+    return;
+  }
+  if (!paths.some((path) => path.date === state.selectedTwin)) {
+    state.selectedTwin = paths[0].date;
+  }
+  $("twinChips").replaceChildren(...paths.map((path) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.active = String(path.date === state.selectedTwin);
+    button.textContent = `${formatDate(path.date)} · ${path.quality}`;
+    button.addEventListener("click", () => selectTwin(path.date));
+    return button;
+  }));
+  renderTwinContributions(play, state.selectedTwin);
+}
+
+function selectTwin(date) {
+  if (!state.analysis?.playbook.available) return;
+  state.selectedTwin = date;
+  renderTwinExplorer(state.analysis.playbook);
+  renderReceipts(state.analysis.playbook);
+  renderChart();
+}
+
+function renderTwinContributions(play, date) {
+  const match = play.matches.find((item) => item.date === date);
+  if (!match) {
+    $("twinContributions").replaceChildren();
+    return;
+  }
+  const heading = document.createElement("div");
+  heading.className = "twin-contribution-heading";
+  const title = document.createElement("strong");
+  title.textContent = `${formatDate(match.date)} · ${match.quality}/100 match`;
+  const outcome = document.createElement("span");
+  outcome.textContent =
+    `Then: ${pct(match.fwd_5d)} after 5 · ${pct(match.fwd_10d)} after 10 · ` +
+    `${pct(match.fwd_21d)} at the horizon`;
+  heading.append(title, outcome);
+  const signals = document.createElement("div");
+  signals.className = "twin-signal-grid";
+  signals.append(...match.contributions.map((item) => {
+    const card = document.createElement("div");
+    const label = document.createElement("span");
+    const score = document.createElement("strong");
+    const track = document.createElement("i");
+    const fill = document.createElement("b");
+    label.textContent = item.label;
+    score.textContent = `${item.closeness}% close`;
+    fill.style.width = `${item.closeness}%`;
+    track.append(fill);
+    card.append(label, score, track);
+    return card;
+  }));
+  $("twinContributions").replaceChildren(heading, signals);
 }
 
 function planRow(icon, key, value, detail, kind) {
@@ -862,8 +1060,10 @@ function renderChart() {
   const projectionDays = play.available ? play.forecast.horizon_days : 0;
   const totalSteps = history.length - 1 + projectionDays;
   const ghosts = play.available
-    ? play.ghost_paths.map((path) =>
-      path.offsets.map((offset) => currentPrice * (1 + offset / 100)))
+    ? play.ghost_paths.map((path) => ({
+      date: path.date,
+      values: path.offsets.map((offset) => currentPrice * (1 + offset / 100)),
+    }))
     : [];
   const projection = play.available ? play.projection : null;
   const coneLower = projection
@@ -879,7 +1079,7 @@ function renderChart() {
 
   const values = [
     ...history.map((point) => point.close),
-    ...ghosts.flat(),
+    ...ghosts.flatMap((path) => path.values),
     ...coneLower,
     ...coneUpper,
     ...(plan?.target ? [plan.target] : []),
@@ -917,7 +1117,13 @@ function renderChart() {
   }
 
   ghosts.forEach((path) => {
-    parts.push(`<path class="chart-ghost" d="${linePath(path, history.length - 1)}"></path>`);
+    const selected = path.date === state.selectedTwin;
+    const className = state.selectedTwin
+      ? `chart-ghost ${selected ? "selected" : "dimmed"}`
+      : "chart-ghost";
+    parts.push(
+      `<path class="${className}" d="${linePath(path.values, history.length - 1)}"></path>`,
+    );
   });
   if (coneMedian.length > 1) {
     parts.push(`<path class="chart-median" d="${linePath(coneMedian, history.length - 1)}"></path>`);
@@ -983,6 +1189,33 @@ function updateWatchButton() {
   renderWatchlist();
 }
 
+function insightFromAnalysis(data) {
+  if (!data?.playbook?.available) return null;
+  return {
+    symbol: data.symbol,
+    price: data.quote.price,
+    currency: data.currency,
+    direction: data.playbook.verdict.direction,
+    probability_up: data.playbook.forecast.probability_up,
+    edge_points: data.playbook.forecast.edge_points,
+    typical_return: data.playbook.forecast.range_21d.typical,
+    evidence_score: data.playbook.forecast.evidence_score,
+    stage: data.stage,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function rememberWatchInsight(data) {
+  const insight = insightFromAnalysis(data);
+  if (!insight) return;
+  state.watchData[data.symbol] = insight;
+  const retained = new Set([data.symbol, ...state.watchlist]);
+  Object.keys(state.watchData).forEach((symbol) => {
+    if (!retained.has(symbol)) delete state.watchData[symbol];
+  });
+  saveWatchInsights();
+}
+
 function renderWatchlist() {
   $("watchlistEmpty").hidden = state.watchlist.length > 0;
   $("watchlist").replaceChildren(...state.watchlist.map((symbol) => {
@@ -991,7 +1224,16 @@ function renderWatchlist() {
     const open = document.createElement("button");
     open.type = "button";
     open.className = "open-symbol";
-    open.textContent = symbol;
+    const name = document.createElement("strong");
+    name.textContent = symbol;
+    const insight = state.watchData[symbol];
+    const detail = document.createElement("span");
+    detail.textContent = insight
+      ? `${insight.probability_up}% up · ` +
+        `${insight.edge_points >= 0 ? "+" : ""}${insight.edge_points} pt edge · ` +
+        `${insight.direction}`
+      : "Not scanned yet";
+    open.append(name, detail);
     open.addEventListener("click", () => loadSymbol(symbol));
     const remove = document.createElement("button");
     remove.type = "button";
@@ -1000,12 +1242,64 @@ function renderWatchlist() {
     remove.textContent = "×";
     remove.addEventListener("click", () => {
       state.watchlist = state.watchlist.filter((item) => item !== symbol);
+      delete state.watchData[symbol];
       saveWatchlist();
+      saveWatchInsights();
       updateWatchButton();
     });
     row.append(open, remove);
     return row;
   }));
+}
+
+async function refreshWatchlist() {
+  if (!state.watchlist.length) {
+    $("watchlistStatus").textContent = "Watch at least one symbol before running a scan.";
+    return;
+  }
+  if (state.watchRefresh) state.watchRefresh.abort();
+  const controller = new AbortController();
+  state.watchRefresh = controller;
+  $("refreshWatchlist").disabled = true;
+  const symbols = [...state.watchlist];
+  let completed = 0;
+  try {
+    for (let index = 0; index < symbols.length; index += 1) {
+      const symbol = symbols[index];
+      $("watchlistStatus").textContent =
+        `Quick-scanning ${symbol} · ${index + 1} of ${symbols.length}`;
+      const response = await fetch(
+        `/api/analyze/${encodeURIComponent(symbol)}/quick`,
+        {
+          signal: controller.signal,
+          headers: { Accept: "application/json" },
+        },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || `${symbol} could not be scanned.`);
+      }
+      const insight = insightFromAnalysis(data);
+      if (insight && state.watchlist.includes(symbol)) {
+        state.watchData[symbol] = insight;
+        saveWatchInsights();
+        completed += 1;
+      }
+      renderWatchlist();
+    }
+    $("watchlistStatus").textContent =
+      `Compared ${completed} watched setup` +
+      `${completed === 1 ? "" : "s"} with preliminary balanced weights.`;
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      $("watchlistStatus").textContent = error.message;
+    }
+  } finally {
+    if (state.watchRefresh === controller) {
+      state.watchRefresh = null;
+      $("refreshWatchlist").disabled = false;
+    }
+  }
 }
 
 $("symbolForm").addEventListener("submit", (event) => {
@@ -1035,6 +1329,7 @@ $("toggleReceipts").addEventListener("click", () => {
 });
 
 $("investAmount").addEventListener("input", updateSizer);
+$("refreshWatchlist").addEventListener("click", refreshWatchlist);
 $("timeMachineForm").addEventListener("submit", (event) => {
   event.preventDefault();
   runTimeMachine($("timeMachineDate").value);

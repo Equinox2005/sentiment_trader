@@ -8,6 +8,7 @@ from playbook import (
     MAX_MATCHES,
     _align_context,
     _calendar_years,
+    _conformal_diagnostics,
     _compute_features,
     _first_touch,
     _match_record,
@@ -179,6 +180,77 @@ class PlaybookTests(unittest.TestCase):
             forecast["analog_probability_up"],
             forecast["probability_high"],
         )
+
+    def test_multi_horizon_forecast_and_conformal_range_are_explicit(self):
+        forecast = self.result["forecast"]
+        validation = self.result["validation"]
+        horizons = forecast["horizons"]
+
+        self.assertEqual([item["days"] for item in horizons], [5, 10, 21])
+        self.assertTrue(validation["conformal"]["available"])
+        self.assertEqual(validation["conformal"]["target_coverage"], 80)
+        self.assertLessEqual(
+            forecast["range_21d"]["low"],
+            forecast["raw_range_21d"]["low"],
+        )
+        self.assertGreaterEqual(
+            forecast["range_21d"]["high"],
+            forecast["raw_range_21d"]["high"],
+        )
+        self.assertEqual(self.result["projection"]["low"][0], 0)
+        self.assertEqual(self.result["projection"]["median"][0], 0)
+        self.assertEqual(self.result["projection"]["high"][0], 0)
+
+    def test_probability_waterfall_agreement_and_twin_support_are_explainable(self):
+        forecast = self.result["forecast"]
+
+        self.assertEqual(len(forecast["waterfall"]), 4)
+        self.assertAlmostEqual(
+            forecast["waterfall"][-1]["value"],
+            forecast["probability_up"],
+            delta=1,
+        )
+        for previous, current in zip(
+            forecast["waterfall"],
+            forecast["waterfall"][1:],
+        ):
+            self.assertAlmostEqual(
+                current["value"] - previous["value"],
+                current["delta"],
+                delta=0.11,
+            )
+        self.assertTrue(0 <= forecast["agreement"]["score"] <= 100)
+        self.assertGreaterEqual(len(forecast["agreement"]["components"]), 2)
+        for match in self.result["matches"][:5]:
+            self.assertGreaterEqual(len(match["contributions"]), 3)
+            self.assertTrue(
+                all(
+                    0 <= item["closeness"] <= 100
+                    for item in match["contributions"]
+                )
+            )
+
+    def test_conformal_adjustment_rounds_outward_before_coverage(self):
+        calibration = [
+            {
+                "interval_low": 0.0,
+                "interval_high": 1.0,
+                "actual_return": 2.234,
+            }
+            for _ in range(5)
+        ]
+        evaluation = [
+            {
+                "interval_low": 0.0,
+                "interval_high": 1.0,
+                "actual_return": 2.235,
+            }
+        ]
+
+        result = _conformal_diagnostics(calibration, evaluation)
+
+        self.assertEqual(result["adjustment_points"], 1.24)
+        self.assertEqual(result["adjusted_coverage"], 100)
 
     def test_news_adjustment_is_bounded_and_visible(self):
         result = build_playbook(

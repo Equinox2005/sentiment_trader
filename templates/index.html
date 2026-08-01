@@ -154,6 +154,14 @@
           <span><i class="swatch swatch-target"></i> Path-derived target</span>
           <span><i class="swatch swatch-stop"></i> Path-derived stop</span>
         </div>
+        <div class="twin-explorer">
+          <div>
+            <strong>Inspect one historical twin</strong>
+            <span>Highlight its future path and see which signals made it feel familiar.</span>
+          </div>
+          <div class="twin-chips" id="twinChips"></div>
+          <div class="twin-contributions" id="twinContributions"></div>
+        </div>
       </section>
 
       <div class="two-column evidence-columns">
@@ -172,6 +180,8 @@
             <div class="range-point high"><span>Stronger path</span><strong id="rangeHigh">—</strong></div>
           </div>
           <div class="evidence-facts" id="evidenceFacts"></div>
+          <div class="horizon-grid" id="horizonGrid"></div>
+          <p class="interval-note" id="intervalNote"></p>
         </section>
 
         <section class="panel reliability-panel" id="reliabilityPanel">
@@ -195,6 +205,31 @@
         </section>
       </div>
 
+      <div class="two-column forecast-explainers">
+        <section class="panel waterfall-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">WHY THIS PROBABILITY</span>
+              <h3>From normal odds to today’s estimate</h3>
+              <p class="panel-sub">Every step is visible: the asset’s base rate, raw twins, statistical shrinkage, then bounded current news.</p>
+            </div>
+          </div>
+          <div class="probability-waterfall" id="probabilityWaterfall"></div>
+        </section>
+        <section class="panel agreement-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">EVIDENCE AGREEMENT</span>
+              <h3 id="agreementLabel">Do the signals tell one story?</h3>
+              <p class="panel-sub">Agreement is descriptive, not extra probability. It shows whether path votes, the typical finish, and current headlines point together.</p>
+            </div>
+            <strong class="agreement-score" id="agreementScore">—</strong>
+          </div>
+          <div class="agreement-track"><i id="agreementFill"></i></div>
+          <div class="agreement-components" id="agreementComponents"></div>
+        </section>
+      </div>
+
       <section class="panel audit-center" id="auditCenter">
         <div class="panel-heading">
           <div>
@@ -209,6 +244,8 @@
           <div><span>Untouched forecasts</span><strong id="auditSample">—</strong><small id="auditPeriod">—</small></div>
           <div><span>Independent checks</span><strong id="auditIndependent">—</strong><small>Used for the 95% range</small></div>
           <div><span>Model / baseline Brier</span><strong id="auditBrier">—</strong><small>Lower is better</small></div>
+          <div><span>Conformal coverage</span><strong id="auditCoverage">—</strong><small id="auditCoverageTarget">Untouched forecasts</small></div>
+          <div><span>Interval expansion</span><strong id="auditExpansion">—</strong><small>Percentage points per side</small></div>
         </div>
         <div class="audit-grid">
           <div class="audit-block">
@@ -339,8 +376,9 @@
         <div class="panel-heading">
           <div>
             <h3>Your watched setups</h3>
-            <p class="panel-sub">Saved in this browser only.</p>
+            <p class="panel-sub" id="watchlistStatus">Saved in this browser only. Audited symbols retain their latest comparison snapshot.</p>
           </div>
+          <button class="toggle-receipts" id="refreshWatchlist" type="button">Quick-scan watched</button>
         </div>
         <div class="watchlist" id="watchlist"></div>
         <p class="empty-note" id="watchlistEmpty">Star a symbol to keep it here.</p>
