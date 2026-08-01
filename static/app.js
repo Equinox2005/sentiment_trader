@@ -5,6 +5,7 @@ const state = {
   timeRequest: null,
   watchRefresh: null,
   selectedTwin: null,
+  activeView: document.body.dataset.initialView || "forecast",
   showAllReceipts: false,
   watchlist: readStoredList(),
   watchData: readStoredInsights(),
@@ -83,7 +84,7 @@ function stopLoading() {
   $("loadingStrip").hidden = true;
 }
 
-async function loadSymbol(rawSymbol) {
+async function loadSymbol(rawSymbol, options = {}) {
   const symbol = String(rawSymbol || "")
     .trim()
     .toUpperCase()
@@ -108,6 +109,9 @@ async function loadSymbol(rawSymbol) {
   $("timeMachineStatus").textContent = "";
   startLoading();
   let quickRendered = false;
+  let pendingInitialLocation = null;
+  const requestedView = options.view || "forecast";
+  const requestedHash = options.initial ? window.location.hash : "";
 
   try {
     const quickResponse = await fetch(`/api/analyze/${encodeURIComponent(symbol)}/quick`, {
@@ -125,9 +129,10 @@ async function loadSymbol(rawSymbol) {
     state.showAllReceipts = false;
     setLoadingStage("Historical twins found. Painting the preliminary forecast…", 58);
     render(quick);
-    const url = new URL(window.location.href);
-    url.searchParams.set("symbol", quick.symbol);
-    window.history.replaceState({}, "", url);
+    updateRoute(quick.symbol, requestedView, requestedHash);
+    if (options.initial) {
+      pendingInitialLocation = `${window.location.pathname}${window.location.hash}`;
+    }
     storageSet("playbook-last-symbol", quick.symbol);
 
     setLoadingStage("Running untouched walk-forward audit checkpoints…", 72);
@@ -150,6 +155,24 @@ async function loadSymbol(rawSymbol) {
     setLoadingStage("Calibrating evidence and finalizing the forecast…", 94);
     render(audited);
     loadTrackRecord(audited.symbol);
+    const requestedTarget = requestedHash
+      ? document.querySelector(requestedHash)
+      : requestedView === "audit"
+        ? $("auditCenter")
+        : null;
+    const currentLocation = `${window.location.pathname}${window.location.hash}`;
+    if (requestedTarget && currentLocation === pendingInitialLocation) {
+      const sectionByHash = {
+        "#verdictCard": "forecast",
+        "#chartPanel": "twins",
+        "#auditCenter": "audit",
+        "#trackRecordPanel": "track",
+      };
+      setActiveNav(sectionByHash[requestedHash] || requestedView);
+      requestAnimationFrame(() => {
+        requestedTarget.scrollIntoView({ behavior: "auto", block: "start" });
+      });
+    }
   } catch (error) {
     if (error.name !== "AbortError" && state.request === controller) {
       $("statusMessage").textContent = quickRendered
@@ -166,6 +189,10 @@ async function loadSymbol(rawSymbol) {
 
 function render(data) {
   const play = data.playbook;
+  document.body.classList.add("has-analysis");
+  $("sectionNav").hidden = false;
+  $("navSymbol").textContent = data.symbol;
+  $("workspace").dataset.stage = data.stage;
   $("workspace").hidden = false;
   $("assetSymbol").textContent = data.symbol;
   $("assetName").textContent = [data.name, data.sector].filter(Boolean).join(" · ");
@@ -220,6 +247,10 @@ function renderForecast(play) {
   $("setupLine").hidden = false;
 
   $("probabilityValue").textContent = `${forecast.probability_up}%`;
+  $("probabilityRing").style.setProperty(
+    "--probability",
+    `${forecast.probability_up * 3.6}deg`,
+  );
   $("probabilityInterval").textContent =
     `Analog evidence range: ${forecast.probability_low}–${forecast.probability_high}%`;
   $("gaugeFill").style.width = `${forecast.evidence_score}%`;
@@ -238,6 +269,64 @@ function renderForecast(play) {
     `${forecast.edge_points >= 0 ? "+" : ""}${forecast.edge_points} pts`;
   $("analogEdge").className =
     forecast.edge_points > 0 ? "positive" : forecast.edge_points < 0 ? "negative" : "";
+
+  const edgeState = $("edgeState");
+  const auditGrade = play.validation.grade;
+  const auditSupported = play.validation.available && auditGrade === "positive";
+  const unsupportedLean = (direction) => auditGrade === "mixed"
+    ? `${direction} lean with mixed audit evidence`
+    : `${direction} lean without enough audit support`;
+  edgeState.textContent = play.preliminary
+    ? "Preliminary balanced match"
+    : verdict.direction === "bullish"
+      ? auditSupported
+        ? "Audit-supported bullish edge"
+        : unsupportedLean("Bullish")
+      : verdict.direction === "bearish"
+        ? auditSupported
+          ? "Audit-supported bearish edge"
+          : unsupportedLean("Bearish")
+        : forecast.analog_direction !== "neutral"
+          ? "Historical lean, current conflict"
+          : "No meaningful analog edge";
+  edgeState.dataset.state = verdict.direction;
+
+  const guardrails = [];
+  if (play.preliminary) {
+    guardrails.push("Adaptive weights and untouched audit are still running.");
+  } else {
+    if (!play.validation.available) {
+      guardrails.push(
+        play.validation.reason
+        || "There are not enough untouched forecasts to establish reliability.",
+      );
+    } else if (play.validation.grade === "limited") {
+      guardrails.push("The untouched audit sample is still too limited for a supported call.");
+    } else if (play.validation.grade === "mixed") {
+      guardrails.push(
+        "The untouched audit is mixed and has not met both tests for historical usefulness.",
+      );
+    } else if (play.validation.grade === "weak") {
+      guardrails.push("This matcher has not beaten its baseline reliably for this asset.");
+    }
+    const conformal = play.validation.conformal;
+    if (
+      conformal?.available
+      && conformal.adjusted_coverage < conformal.target_coverage - 5
+    ) {
+      guardrails.push(
+        `The projection interval covered ${conformal.adjusted_coverage}% of holdout outcomes, ` +
+        `below its ${conformal.target_coverage}% target.`,
+      );
+    }
+    if (forecast.evidence_score < 45) {
+      guardrails.push("Independent evidence is thin; treat the estimate as fragile.");
+    }
+  }
+  $("edgeGuardrail").textContent = guardrails.length
+    ? guardrails.join(" ")
+    : "No audit guardrail is triggered, but this remains a historical estimate—not a promise.";
+  $("edgeGuardrail").dataset.state = guardrails.length ? "caution" : "clear";
 }
 
 function renderFingerprint(play) {
@@ -613,7 +702,10 @@ function renderUnavailable(play) {
   $("verdictExplanation").textContent = play.reason;
   $("horizonKicker").textContent = "One-month analog forecast";
   $("probabilityValue").textContent = "—";
+  $("probabilityRing").style.setProperty("--probability", "0deg");
   $("probabilityInterval").textContent = "No probability generated";
+  $("edgeState").textContent = "No forecast";
+  $("edgeState").dataset.state = "neutral";
   $("gaugeFill").style.width = "0%";
   $("confidenceLabel").textContent = "No evidence";
   ["analogProbability", "baselineProbability", "newsAdjustment", "analogEdge"]
@@ -642,6 +734,8 @@ function renderUnavailable(play) {
   $("planNote").textContent = "A defensible risk plan requires historical analog evidence first.";
   $("planSizer").hidden = true;
   $("catalystWarning").hidden = true;
+  $("edgeGuardrail").textContent = play.reason;
+  $("edgeGuardrail").dataset.state = "caution";
   $("chartTooltip").hidden = true;
   $("twinChips").replaceChildren();
   $("twinContributions").replaceChildren();
@@ -1252,6 +1346,40 @@ function renderWatchlist() {
   }));
 }
 
+function updateRoute(symbol, view = "forecast", hash = "") {
+  state.activeView = view;
+  const route = view === "audit" ? "audit" : "forecast";
+  const path = `/${route}/${encodeURIComponent(symbol)}${hash}`;
+  window.history.replaceState({}, "", path);
+  setActiveNav(view);
+}
+
+function setActiveNav(section) {
+  document.querySelectorAll("#sectionNav [data-section]").forEach((link) => {
+    link.dataset.active = String(link.dataset.section === section);
+  });
+}
+
+async function shareCurrentView() {
+  const button = $("shareView");
+  try {
+    await navigator.clipboard.writeText(window.location.href);
+    button.textContent = "Link copied";
+  } catch {
+    const field = document.createElement("textarea");
+    field.value = window.location.href;
+    field.setAttribute("readonly", "");
+    field.style.position = "fixed";
+    field.style.opacity = "0";
+    document.body.append(field);
+    field.select();
+    document.execCommand("copy");
+    field.remove();
+    button.textContent = "Link copied";
+  }
+  window.setTimeout(() => { button.textContent = "Share this view"; }, 1800);
+}
+
 async function refreshWatchlist() {
   if (!state.watchlist.length) {
     $("watchlistStatus").textContent = "Watch at least one symbol before running a scan.";
@@ -1330,6 +1458,21 @@ $("toggleReceipts").addEventListener("click", () => {
 
 $("investAmount").addEventListener("input", updateSizer);
 $("refreshWatchlist").addEventListener("click", refreshWatchlist);
+$("shareView").addEventListener("click", shareCurrentView);
+document.querySelectorAll("#sectionNav [data-section]").forEach((link) => {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    const section = link.dataset.section;
+    const target = document.querySelector(link.getAttribute("href"));
+    if (!target || !state.analysis) return;
+    const view = section === "audit" || section === "track"
+      ? "audit" : "forecast";
+    const hash = link.getAttribute("href");
+    updateRoute(state.analysis.symbol, view, hash);
+    setActiveNav(section);
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+});
 $("timeMachineForm").addEventListener("submit", (event) => {
   event.preventDefault();
   runTimeMachine($("timeMachineDate").value);
@@ -1345,6 +1488,22 @@ const savedTheme = storageGet("playbook-theme")
 document.documentElement.dataset.theme = savedTheme;
 renderWatchlist();
 
-const initialSymbol = new URLSearchParams(window.location.search).get("symbol")
-  || storageGet("playbook-last-symbol");
-if (initialSymbol) loadSymbol(initialSymbol);
+const routeError = document.body.dataset.routeError;
+const initialSymbol = document.body.dataset.initialSymbol
+  || (
+    routeError
+      ? null
+      : new URLSearchParams(window.location.search).get("symbol")
+        || storageGet("playbook-last-symbol")
+  );
+if (routeError) {
+  $("statusMessage").textContent = routeError === "invalid_symbol"
+    ? "That shared market symbol is invalid. Enter a valid symbol below."
+    : "That Playbook page does not exist. Start with a market symbol below.";
+}
+if (initialSymbol) {
+  loadSymbol(initialSymbol, {
+    view: document.body.dataset.initialView || "forecast",
+    initial: true,
+  });
+}

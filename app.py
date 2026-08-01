@@ -8,6 +8,7 @@ from market_data import (
     MarketDataError,
     MarketIntelligenceService,
     YahooFinanceProvider,
+    normalize_symbol,
 )
 from storage import PlaybookStore
 
@@ -30,7 +31,48 @@ def create_app(service=None):
 
     @app.get("/")
     def index():
-        return render_template("index.html")
+        return render_template(
+            "index.html",
+            initial_symbol="",
+            initial_view="forecast",
+            route_error="",
+        )
+
+    @app.get("/forecast/<symbol>")
+    def forecast_page(symbol):
+        try:
+            initial_symbol = normalize_symbol(symbol)
+        except InvalidSymbolError:
+            return render_template(
+                "index.html",
+                initial_symbol="",
+                initial_view="forecast",
+                route_error="invalid_symbol",
+            ), 404
+        return render_template(
+            "index.html",
+            initial_symbol=initial_symbol,
+            initial_view="forecast",
+            route_error="",
+        )
+
+    @app.get("/audit/<symbol>")
+    def audit_page(symbol):
+        try:
+            initial_symbol = normalize_symbol(symbol)
+        except InvalidSymbolError:
+            return render_template(
+                "index.html",
+                initial_symbol="",
+                initial_view="audit",
+                route_error="invalid_symbol",
+            ), 404
+        return render_template(
+            "index.html",
+            initial_symbol=initial_symbol,
+            initial_view="audit",
+            route_error="",
+        )
 
     @app.get("/api/health")
     def health():
@@ -157,7 +199,12 @@ def create_app(service=None):
     def not_found(_error):
         if request.path.startswith("/api/"):
             return jsonify({"error": "API endpoint not found", "code": "not_found"}), 404
-        return render_template("index.html"), 404
+        return render_template(
+            "index.html",
+            initial_symbol="",
+            initial_view="forecast",
+            route_error="not_found",
+        ), 404
 
     return app
 

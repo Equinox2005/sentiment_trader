@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   <script defer src="{{ url_for('static', filename='app.js') }}"></script>
 </head>
-<body>
+<body data-initial-symbol="{{ initial_symbol|default('') }}" data-initial-view="{{ initial_view|default('forecast') }}" data-route-error="{{ route_error|default('') }}">
   <header class="site-header">
     <a class="brand" href="/">
       <span class="brand-mark" aria-hidden="true">⟲</span>
@@ -19,6 +19,17 @@
       <button class="icon-button" id="themeToggle" type="button" aria-label="Switch color theme">◐</button>
     </div>
   </header>
+
+  <nav class="section-nav" id="sectionNav" aria-label="Playbook sections" hidden>
+    <div>
+      <strong id="navSymbol">Playbook</strong>
+      <a href="#verdictCard" data-section="forecast">Forecast</a>
+      <a href="#chartPanel" data-section="twins">Twins</a>
+      <a href="#auditCenter" data-section="audit">Audit</a>
+      <a href="#trackRecordPanel" data-section="track">Track record</a>
+      <button id="shareView" type="button">Share this view</button>
+    </div>
+  </nav>
 
   <main>
     <section class="hero" id="hero">
@@ -45,6 +56,31 @@
       </div>
     </section>
 
+    <section class="landing-proof" id="landingProof">
+      <div class="landing-proof-heading">
+        <span class="eyebrow">A forecast should leave receipts</span>
+        <h2>Playbook is built to be challenged, not believed.</h2>
+        <p>Before a probability is finalized, the same matching method is frozen, replayed on later unseen dates, calibrated on an older period, and compared with doing nothing clever.</p>
+      </div>
+      <div class="proof-demo">
+        <article>
+          <span>01 · Seal the date</span>
+          <strong>No future rows</strong>
+          <p>Time Machine reconstructs any past setup using only information available after that session closed.</p>
+        </article>
+        <article>
+          <span>02 · Grade every five sessions</span>
+          <strong>Dense holdout audit</strong>
+          <p>Calibration, Brier skill, regimes, and interval coverage stay visible—even when results disappoint.</p>
+        </article>
+        <article>
+          <span>03 · Lock live calls</span>
+          <strong>An immutable ledger</strong>
+          <p>Completed-session forecasts are stored once and graded only after the exact future-session horizon matures.</p>
+        </article>
+      </div>
+    </section>
+
     <p class="status-message" id="statusMessage" role="status" aria-live="polite"></p>
     <div class="loading-strip" id="loadingStrip" hidden>
       <div class="loading-track"><div class="loading-bar" id="loadingBar"></div></div>
@@ -52,7 +88,7 @@
     </div>
 
     <section class="workspace" id="workspace" hidden>
-      <section class="verdict-card forecast-card" id="verdictCard">
+      <section class="verdict-card forecast-card reveal-section" id="verdictCard">
         <div class="verdict-top">
           <div class="asset-line">
             <span class="asset-symbol" id="assetSymbol">—</span>
@@ -79,14 +115,19 @@
           </div>
 
           <div class="probability-block">
-            <span class="probability-label">Chance of finishing higher</span>
-            <strong class="probability-value" id="probabilityValue">—</strong>
+            <div class="probability-ring" id="probabilityRing">
+              <div>
+                <span class="probability-label">Chance of finishing higher</span>
+                <strong class="probability-value" id="probabilityValue">—</strong>
+              </div>
+            </div>
             <span class="probability-interval" id="probabilityInterval">—</span>
+            <span class="edge-state" id="edgeState">Waiting for evidence</span>
             <div class="gauge-track"><div class="gauge-fill" id="gaugeFill"></div></div>
             <div class="gauge-labels">
-              <span>Thin evidence</span>
+              <span>Evidence quality</span>
               <span id="confidenceLabel">—</span>
-              <span>Strong evidence</span>
+              <span>95 max</span>
             </div>
           </div>
         </div>
@@ -119,9 +160,10 @@
           <p id="storySummary"></p>
         </div>
         <div class="catalyst-warning" id="catalystWarning" hidden></div>
+        <div class="edge-guardrail" id="edgeGuardrail"></div>
       </section>
 
-      <section class="panel fingerprint-panel">
+      <section class="panel fingerprint-panel reveal-section">
         <div class="panel-heading">
           <div>
             <span class="section-number">01 · FINGERPRINT TODAY</span>
@@ -134,7 +176,7 @@
         <div class="matching-strip" id="matchingStrip"></div>
       </section>
 
-      <section class="panel chart-panel">
+      <section class="panel chart-panel reveal-section" id="chartPanel">
         <div class="panel-heading">
           <div>
             <span class="section-number">02 · REPLAY THE TWINS</span>
@@ -164,7 +206,7 @@
         </div>
       </section>
 
-      <div class="two-column evidence-columns">
+      <div class="two-column evidence-columns reveal-section">
         <section class="panel range-panel">
           <div class="panel-heading">
             <div>
@@ -205,7 +247,7 @@
         </section>
       </div>
 
-      <div class="two-column forecast-explainers">
+      <div class="two-column forecast-explainers reveal-section">
         <section class="panel waterfall-panel">
           <div class="panel-heading">
             <div>
@@ -230,7 +272,7 @@
         </section>
       </div>
 
-      <section class="panel audit-center" id="auditCenter">
+      <section class="panel audit-center reveal-section" id="auditCenter">
         <div class="panel-heading">
           <div>
             <span class="section-number">05 · OPEN THE AUDIT</span>
@@ -282,7 +324,7 @@
         </details>
       </section>
 
-      <section class="panel receipts-panel">
+      <section class="panel receipts-panel reveal-section">
         <div class="panel-heading">
           <div>
             <span class="section-number">06 · INSPECT THE EVIDENCE</span>
@@ -308,7 +350,7 @@
         </div>
       </section>
 
-      <div class="two-column proof-tools">
+      <div class="two-column proof-tools reveal-section">
         <section class="panel time-machine-panel">
           <div class="panel-heading">
             <div>
@@ -328,7 +370,7 @@
           <div class="time-machine-result" id="timeMachineResult" hidden></div>
         </section>
 
-        <section class="panel track-record-panel">
+        <section class="panel track-record-panel" id="trackRecordPanel">
           <div class="panel-heading">
             <div>
               <span class="section-number">PROVE IT · LIVE TRACK RECORD</span>
@@ -342,7 +384,7 @@
         </section>
       </div>
 
-      <div class="two-column">
+      <div class="two-column reveal-section">
         <section class="panel plan-panel">
           <div class="panel-heading">
             <div>
@@ -372,7 +414,7 @@
         </section>
       </div>
 
-      <section class="panel watchlist-panel">
+      <section class="panel watchlist-panel reveal-section">
         <div class="panel-heading">
           <div>
             <h3>Your watched setups</h3>

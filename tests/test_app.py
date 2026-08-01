@@ -106,6 +106,20 @@ class AppTests(unittest.TestCase):
         self.assertIn(b"Playbook", response.data)
         self.assertIn(b"receipts", response.data)
 
+    def test_shareable_forecast_and_audit_pages_embed_route_state(self):
+        forecast = self.client.get("/forecast/nvda")
+        audit = self.client.get("/audit/BTC-USD")
+        invalid = self.client.get("/forecast/TOO-LONG-SYMBOL")
+
+        self.assertEqual(forecast.status_code, 200)
+        self.assertIn(b'data-initial-symbol="NVDA"', forecast.data)
+        self.assertIn(b'data-initial-view="forecast"', forecast.data)
+        self.assertEqual(audit.status_code, 200)
+        self.assertIn(b'data-initial-symbol="BTC-USD"', audit.data)
+        self.assertIn(b'data-initial-view="audit"', audit.data)
+        self.assertEqual(invalid.status_code, 404)
+        self.assertIn(b'data-route-error="invalid_symbol"', invalid.data)
+
 
 if __name__ == "__main__":
     unittest.main()
