@@ -2,5 +2,13 @@
 __pycache__/
 *.py[cod]
 .env
+.venv/
 venv/
+.pytest_cache/
+.coverage
+htmlcov/
 .vscode/
+
+# Local tooling
+.DS_Store
+*.log

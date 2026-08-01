@@ -1,95 +1,107 @@
-````markdown
-# Sentiment Trader
+# Playbook
 
-Live and historical sentiment-driven trading signals from Reddit comments.
+**Find today's closest historical market twins. See every future that followed.**
 
-## Features
+Playbook is a no-login historical-analog forecasting website for stocks, ETFs, indices, and crypto. It converts the complete current setup into a market fingerprint, searches up to 20 years for independent look-alike episodes, replays their next month, and shows whether this exact matching method worked at untouched historical checkpoints.
 
-- Backfill: Fetches the most recent comments from your chosen subreddits.
-- Real-time stream: Continues listening for new comments as they appear.
-- Keyword tracking: Monitors comments matching your custom keywords (e.g. “Tesla”, “NVIDIA”).
-- Sentiment analysis: Base sentiment from VADER (or your choice) plus tweaks for “bearish”, “bullish”, “red”, “green”.
-- Live price lookup: Fetches the latest ticker price via Yahoo Finance.
-- Per-ticker averages: Displays running average sentiment per symbol.
-- Subreddit info: Shows which subreddit each comment came from.
-- GUI: Simple PySimpleGUI desktop interface.
+It does not hide uncertainty behind a single indicator or an unexplained confidence number. Every forecast exposes:
 
-## 📦 Installation
+- today's fingerprint;
+- every dated historical match;
+- the paths and outcome distribution that produced the estimate;
+- the asset's normal up-rate, which the analogs must beat;
+- an uncertainty range based on effective independent evidence;
+- walk-forward performance against a simple baseline;
+- any small adjustment made by current headlines.
 
-1. **Clone the repo**
+## What the fingerprint contains
 
-   ```bash
-   git clone https://github.com/Equinox2005/sentiment_trader.git
-   cd sentiment_trader
-````
+The engine uses adjusted OHLCV data and, when available, aligned SPY/VIX context:
 
-2. **Create & activate a virtual environment**
+- 1-month and 3-month momentum;
+- correctly handled Wilder-style RSI;
+- short-, medium-, and long-term trend structure;
+- current volatility and volatility expansion/contraction;
+- drawdown from the trailing one-year high;
+- ATR and five-day candlestick pressure;
+- five-day versus twenty-day volume;
+- prior-session SPY momentum/trend and trailing VIX percentile;
+- the normalized geometry of the complete trailing one-month price path.
 
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
+Missing optional inputs are excluded consistently from both live matching and historical validation. Broad-market context is lagged by one US session so an earlier-closing global market never receives a US close that had not happened yet.
 
-3. **Install dependencies**
+## How matching works
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+1. **Fingerprint today.** Every feature is trailing/as-of; future data is never used to describe a historical day.
+2. **Scale robustly.** Candidate history determines each feature's median and median absolute deviation. Extreme values are clipped so one crisis observation cannot dominate the distance.
+3. **Select the weighting model.** Balanced, price-structure, regime, and participation profiles compete on older walk-forward checkpoints. The lowest-Brier profile wins.
+4. **Protect the audit.** Newer checkpoints remain untouched until the chosen profile is evaluated.
+5. **Find independent twins.** Weighted feature distance and one-month chart-shape distance rank past dates. Up to 30 matches are selected. Exchange-traded assets use 21-session shapes and 42-session episode spacing; seven-day markets use 30-calendar-day shapes and 60-day spacing. The recent exclusion window prevents a candidate's forward path from overlapping today's fingerprint.
+6. **Weight the evidence.** Closer matches contribute more through a stable kernel whose bandwidth targets a healthy effective sample size. Evidence is capped by the number of calendar years represented.
+7. **Beat the base rate.** The probability is shrunk toward the asset's own as-of historical up-rate. A bullish or bearish verdict requires an edge over that rate plus a compatible median return—not merely a result above or below 50%.
 
-## 🔧 Configuration
+The **match score** is a distance score from 1–99. It is not a probability.
 
-Create a `.env` file in the project root:
+## Forecasts, news, and risk
 
-```ini
-REDDIT_CLIENT_ID=your_reddit_app_client_id
-REDDIT_CLIENT_SECRET=your_reddit_app_client_secret
-REDDIT_USER_AGENT=YourAppName/0.1 by u/YourRedditUsername
+The headline horizon is one market month: 21 trading sessions for exchange-traded assets and 30 calendar days for seven-day markets such as crypto. Momentum, volatility annualization, trend windows, shape matching, spacing, projections, and validation all use that same detected sampling calendar. Playbook reports the similarity-weighted 20th percentile, median, and 80th percentile returns plus a Bayesian evidence interval for the chance of finishing higher.
+
+Recent headline sentiment can move the displayed probability by at most five percentage points. News can strengthen, weaken, or cancel an analog edge, but it cannot create one or reverse its direction. Historical article sentiment is not used in matching because the free data source does not provide a reliable historical news archive.
+
+Stops and targets come from each matched path's actual intramonth adverse and favorable excursion—not its month-end return. The plan simulates which level was touched first and includes unresolved paths at their final return. If those paths do not support positive expectancy and defensible reward/risk, Playbook refuses to manufacture a trade.
+
+Known upcoming earnings within seven days are shown as catalyst risk rather than pretended to be an ordinary analog feature.
+
+## Walk-forward reliability
+
+For each historical checkpoint, Playbook:
+
+1. uses only information available on that date;
+2. builds scaling parameters from earlier candidate history;
+3. excludes candidates whose future outcome was not yet known;
+4. runs the same matcher used for today's forecast;
+5. compares its probability with the realized 21-day direction.
+
+The UI reports directional accuracy with a 95% Wilson interval, Brier score, stronger-edge coverage, and the accuracy of simply choosing the asset's normal direction. A small or weak validation sample is labeled accordingly; it is not presented as proven accuracy.
+
+## Run locally
+
+Requires Python 3.10+.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python app.py
 ```
 
-## 🚀 Usage
+Open [http://localhost:8000](http://localhost:8000). Yahoo Finance supplies market data; no API key is required.
 
-```bash
-python app_gui.py
+## Test
+
+```powershell
+python -m unittest discover -s tests -v
 ```
 
-1. **Enter** a comma-separated list of keywords (e.g. `Tesla, NVIDIA, AMD`).
-2. **For each keyword**, enter its ticker symbol (include `$`, e.g. `$TSLA`).
-3. The app backfills the last 24 hours of comments, then opens the GUI:
+The 30-test suite covers the richer fingerprint, corrected RSI edge case, independent episode spacing, bounded news adjustment, post-entry intraday path outcomes, extreme base rates, global session-date alignment, crypto calendar windows, base-rate shrinkage, walk-forward reporting, service caching, API errors, and sentiment behavior.
 
-   * **Message pane** shows each comment + sentiment, subreddit, time, price.
-   * **Summary** shows total comments and overall average sentiment.
-   * **Per-ticker box** shows average sentiment per ticker.
+## API
 
-## 🗂 File Structure
-
-```
-sentiment-trader/
-├── app_gui.py         # main PySimpleGUI application
-├── stream.py          # Reddit streaming logic
-├── sentiment.py       # VADER (or keyword) sentiment functions
-├── aggregator.py      # time-bucket aggregation
-├── signals.py         # buy/sell signal logic
-├── config.py          # loads your .env variables
-├── requirements.txt
-├── .env               # your Reddit credentials (not committed)
-├── .gitignore
-└── README.md
+```text
+GET /api/health
+GET /api/analyze/NVDA
+GET /api/analyze/BTC-USD?refresh=1
 ```
 
-## Dependencies
+Responses are cached in memory for five minutes. `?refresh=1` bypasses the cache.
 
-* [PySimpleGUI](https://pypi.org/project/PySimpleGUI/)
-* [PRAW](https://praw.readthedocs.io/)
-* [yfinance](https://pypi.org/project/yfinance/)
-* [python-dotenv](https://pypi.org/project/python-dotenv/)
-* [pandas](https://pypi.org/project/pandas/)
-* [nltk](https://pypi.org/project/nltk/)
-* [requests](https://pypi.org/project/requests/)
-* [matplotlib](https://pypi.org/project/matplotlib/) *(if using chart features)*
-* [numpy](https://pypi.org/project/numpy/)
-* [transformers](https://pypi.org/project/transformers/) & [torch](https://pypi.org/project/torch/) *(optional)*
+## Docker
 
-
-
+```powershell
+docker build -t playbook .
+docker run --rm -p 8000:8000 playbook
 ```
-```
+
+## Important limitation
+
+Historical analogs estimate a distribution; they do not know the future. Earnings surprises, policy decisions, liquidity shocks, changing businesses, and unprecedented events can invalidate every match. Walk-forward results are symbol-specific and based on a limited number of independent checkpoints. Playbook is a research instrument, not financial advice or a profitability guarantee.

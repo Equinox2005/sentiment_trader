@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Playbook fingerprints today's complete market setup, finds its closest historical twins, and shows every path that followed.">
+  <title>Playbook — Historical setup matching</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">⟲</span>
+      <span>Playbook</span>
+    </a>
+    <div class="header-actions">
+      <span class="tagline">Historical analog forecasting</span>
+      <button class="icon-button" id="themeToggle" type="button" aria-label="Switch color theme">◐</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero" id="hero">
+      <span class="eyebrow">The market has seen versions of today before</span>
+      <h1>Find today’s closest market twins. <em>See what happened next.</em></h1>
+      <p class="hero-lede">
+        Playbook turns the current chart, trend, volatility, volume, pressure, and broad-market regime
+        into one fingerprint. It searches up to <strong>20 years</strong> for independent look-alike
+        setups, replays their next month, and checks whether this method actually worked before.
+      </p>
+
+      <form class="symbol-search" id="symbolForm" role="search">
+        <label class="sr-only" for="symbolInput">Stock, ETF, index, or crypto symbol</label>
+        <input id="symbolInput" autocomplete="off" spellcheck="false" maxlength="12" placeholder="Enter NVDA, SPY, BTC-USD…">
+        <button type="submit">Find its twins</button>
+      </form>
+      <div class="quick-picks">
+        <span>Try a setup:</span>
+        <button type="button" data-symbol="NVDA">NVDA</button>
+        <button type="button" data-symbol="AAPL">AAPL</button>
+        <button type="button" data-symbol="TSLA">TSLA</button>
+        <button type="button" data-symbol="SPY">SPY</button>
+        <button type="button" data-symbol="BTC-USD">Bitcoin</button>
+      </div>
+    </section>
+
+    <p class="status-message" id="statusMessage" role="status" aria-live="polite"></p>
+    <div class="loading-strip" id="loadingStrip" hidden>
+      <div class="loading-bar"></div>
+      <p id="loadingText">Building today’s market fingerprint…</p>
+    </div>
+
+    <section class="workspace" id="workspace" hidden>
+      <section class="verdict-card forecast-card" id="verdictCard">
+        <div class="verdict-top">
+          <div class="asset-line">
+            <span class="asset-symbol" id="assetSymbol">—</span>
+            <span class="asset-name" id="assetName">—</span>
+          </div>
+          <div class="asset-price-line">
+            <strong id="assetPrice">—</strong>
+            <span class="change-pill" id="dailyChange">—</span>
+            <button class="watch-button" id="watchButton" type="button" aria-pressed="false">☆ Watch</button>
+          </div>
+        </div>
+
+        <div class="forecast-main">
+          <div class="forecast-verdict">
+            <span class="verdict-kicker" id="horizonKicker">One-month analog forecast</span>
+            <div class="verdict-headline-block">
+              <span class="verdict-arrow" id="verdictArrow">→</span>
+              <div>
+                <h2 id="verdictHeadline">Analyzing the closest setups…</h2>
+                <p id="verdictExplanation" class="verdict-explanation"></p>
+              </div>
+            </div>
+            <p class="setup-line" id="setupLine"></p>
+          </div>
+
+          <div class="probability-block">
+            <span class="probability-label">Chance of finishing higher</span>
+            <strong class="probability-value" id="probabilityValue">—</strong>
+            <span class="probability-interval" id="probabilityInterval">—</span>
+            <div class="gauge-track"><div class="gauge-fill" id="gaugeFill"></div></div>
+            <div class="gauge-labels">
+              <span>Thin evidence</span>
+              <span id="confidenceLabel">—</span>
+              <span>Strong evidence</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="probability-ledger" id="probabilityLedger">
+          <div>
+            <span>Closest analogs</span>
+            <strong id="analogProbability">—</strong>
+            <small>Similarity-weighted</small>
+          </div>
+          <div>
+            <span>Asset’s normal rate</span>
+            <strong id="baselineProbability">—</strong>
+            <small>The benchmark to beat</small>
+          </div>
+          <div>
+            <span>News adjustment</span>
+            <strong id="newsAdjustment">—</strong>
+            <small>Bounded to ±5 points</small>
+          </div>
+          <div>
+            <span>Analog edge</span>
+            <strong id="analogEdge">—</strong>
+            <small>Versus normal history</small>
+          </div>
+        </div>
+
+        <div class="story-check" id="storyCheck" hidden>
+          <span class="story-icon" id="storyIcon">📰</span>
+          <p id="storySummary"></p>
+        </div>
+        <div class="catalyst-warning" id="catalystWarning" hidden></div>
+      </section>
+
+      <section class="panel fingerprint-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="section-number">01 · FINGERPRINT TODAY</span>
+            <h3>The setup Playbook is matching</h3>
+            <p class="panel-sub">Not one indicator—a compact description of the entire market state and recent chart shape.</p>
+          </div>
+          <span class="profile-pill" id="profilePill">—</span>
+        </div>
+        <div class="fingerprint-grid" id="fingerprintGrid"></div>
+        <div class="matching-strip" id="matchingStrip"></div>
+      </section>
+
+      <section class="panel chart-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="section-number">02 · REPLAY THE TWINS</span>
+            <h3>Every historical future, replayed from today</h3>
+            <p class="panel-sub" id="chartSub">Each faint line is a real path after a look-alike setup. The band is the similarity-weighted 20th–80th percentile range.</p>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <svg id="mainChart" viewBox="0 0 900 360" preserveAspectRatio="none" role="img" aria-label="Current price history and historical analog paths"></svg>
+          <div class="chart-tooltip" id="chartTooltip" hidden><span></span><strong></strong></div>
+        </div>
+        <div class="chart-legend">
+          <span><i class="swatch swatch-price"></i> Actual price</span>
+          <span><i class="swatch swatch-ghost"></i> Closest historical paths</span>
+          <span><i class="swatch swatch-cone"></i> Weighted outcome range</span>
+          <span><i class="swatch swatch-median"></i> Typical path</span>
+          <span><i class="swatch swatch-target"></i> Path-derived target</span>
+          <span><i class="swatch swatch-stop"></i> Path-derived stop</span>
+        </div>
+      </section>
+
+      <div class="two-column evidence-columns">
+        <section class="panel range-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">03 · READ THE DISTRIBUTION</span>
+              <h3>Where the next month landed</h3>
+              <p class="panel-sub">The range matters more than one seductive prediction.</p>
+            </div>
+          </div>
+          <div class="range-track">
+            <div class="range-point low"><span>Weaker path</span><strong id="rangeLow">—</strong></div>
+            <div class="range-line"><i id="rangeMedianMarker"></i></div>
+            <div class="range-point typical"><span>Typical</span><strong id="rangeTypical">—</strong></div>
+            <div class="range-point high"><span>Stronger path</span><strong id="rangeHigh">—</strong></div>
+          </div>
+          <div class="evidence-facts" id="evidenceFacts"></div>
+        </section>
+
+        <section class="panel reliability-panel" id="reliabilityPanel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">04 · AUDIT THE METHOD</span>
+              <h3>Did this matcher work before?</h3>
+              <p class="panel-sub">Untouched walk-forward checkpoints—not the same dates used to tune its weights.</p>
+            </div>
+            <span class="reliability-grade" id="reliabilityGrade">—</span>
+          </div>
+          <div class="reliability-score">
+            <strong id="validationAccuracy">—</strong>
+            <span id="validationAccuracyLabel">directional accuracy</span>
+          </div>
+          <div class="comparison-bars">
+            <div><span>Playbook</span><i><b id="playbookBar"></b></i><strong id="playbookAccuracy">—</strong></div>
+            <div><span>Always choose the asset’s normal direction</span><i><b id="baselineBar"></b></i><strong id="baselineAccuracy">—</strong></div>
+          </div>
+          <p class="validation-note" id="validationNote"></p>
+        </section>
+      </div>
+
+      <section class="panel receipts-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="section-number">05 · INSPECT THE EVIDENCE</span>
+            <h3>The historical twins</h3>
+            <p class="panel-sub">Every row is a real, independent setup. Match quality is a distance score—not a probability.</p>
+          </div>
+          <button class="toggle-receipts" id="toggleReceipts" type="button">Show all matches</button>
+        </div>
+        <div class="receipts-table-wrap">
+          <table class="receipts-table">
+            <thead>
+              <tr>
+                <th>Look-alike date</th>
+                <th>Match score</th>
+                <th>Regime</th>
+                <th>Worst dip</th>
+                <th>Best rise</th>
+                <th>Month finish</th>
+              </tr>
+            </thead>
+            <tbody id="receiptsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="two-column">
+        <section class="panel plan-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">SUPPORTING · RISK PLAN</span>
+              <h3 id="planTitle">Only if the paths support a trade</h3>
+              <p class="panel-sub" id="planNote"></p>
+            </div>
+          </div>
+          <div class="plan-rows" id="planRows"></div>
+          <div class="plan-sizer" id="planSizer">
+            <label>If I invest
+              <span class="input-shell"><i>$</i><input id="investAmount" type="number" min="10" step="50" value="1000"></span>
+            </label>
+            <div class="sizer-results" id="sizerResults"></div>
+          </div>
+        </section>
+
+        <section class="panel news-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">SUPPORTING · FRESH INFORMATION</span>
+              <h3>Today’s headlines</h3>
+              <p class="panel-sub" id="newsSub"></p>
+            </div>
+          </div>
+          <div class="news-list" id="newsList"></div>
+        </section>
+      </div>
+
+      <section class="panel watchlist-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>Your watched setups</h3>
+            <p class="panel-sub">Saved in this browser only.</p>
+          </div>
+        </div>
+        <div class="watchlist" id="watchlist"></div>
+        <p class="empty-note" id="watchlistEmpty">Star a symbol to keep it here.</p>
+      </section>
+
+      <details class="methodology">
+        <summary>Exactly how this forecast was built—and what remains uncertain</summary>
+        <div id="methodologyText"></div>
+      </details>
+    </section>
+  </main>
+
+  <footer>
+    <p><strong>Playbook</strong> is a historical research instrument, not a promise or financial advice. Its probability is an estimate from similar past paths, and its walk-forward sample is shown so you can judge the evidence yourself.</p>
+  </footer>
+</body>
+</html>

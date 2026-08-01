@@ -1,10 +1,5 @@
-requests
-PySimpleGUI
-praw
-yfinance
-python-dotenv
-pandas
-numpy
-nltk
-transformers
-torch
+Flask>=3.1,<4
+gunicorn>=23,<24
+pandas>=2.2,<3
+numpy>=1.26,<3
+yfinance>=0.2.65,<1
