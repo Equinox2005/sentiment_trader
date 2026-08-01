@@ -6,9 +6,12 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from market_data import (
+    _build_track_record,
     _deserialize_source,
+    _session_is_complete,
     _serialize_source,
     InvalidSymbolError,
+    InvalidDateError,
     MarketDataError,
     MarketIntelligenceService,
     YahooFinanceProvider,
@@ -274,6 +277,7 @@ class MarketIntelligenceTests(unittest.TestCase):
 
             self.assertIsInstance(restored.index, pd.DatetimeIndex)
             self.assertIsNotNone(restored.index.tz)
+            self.assertEqual(str(restored.index.tz), timezone_name)
             self.assertEqual(len(restored), len(history))
             self.assertEqual(
                 restored.index[-1].date(),
@@ -295,6 +299,70 @@ class MarketIntelligenceTests(unittest.TestCase):
             self.service._get_cached(cache_key),
             {"price": 202},
         )
+
+    def test_time_machine_uses_only_data_available_as_of_session(self):
+        history = make_history()
+        selected_position = len(history) - 100
+        selected_date = history.index[selected_position].date().isoformat()
+
+        result = self.service.analyze_as_of("TEST", selected_date)
+
+        self.assertEqual(result["stage"], "time_machine")
+        self.assertEqual(result["as_of"], selected_date)
+        self.assertFalse(result["time_machine"]["future_data_used"])
+        self.assertTrue(result["time_machine"]["outcome"]["available"])
+        self.assertEqual(result["history"][-1]["date"], selected_date)
+        self.assertEqual(result["news"], [])
+
+    def test_time_machine_rejects_future_date(self):
+        with self.assertRaises(InvalidDateError):
+            self.service.analyze_as_of("TEST", "2099-01-01")
+
+    def test_only_prior_calendar_sessions_are_immutable(self):
+        now = pd.Timestamp("2025-06-10 20:00:00", tz="UTC")
+
+        self.assertFalse(
+            _session_is_complete(
+                pd.Timestamp("2025-06-10", tz="UTC"),
+                now=now,
+            )
+        )
+        self.assertTrue(
+            _session_is_complete(
+                pd.Timestamp("2025-06-09", tz="UTC"),
+                now=now,
+            )
+        )
+        self.assertFalse(
+            _session_is_complete(
+                pd.Timestamp("2025-06-10"),
+                timezone_name="America/New_York",
+                now=pd.Timestamp("2025-06-11 00:30:00", tz="UTC"),
+            )
+        )
+
+    def test_flat_return_is_not_a_correct_bearish_live_call(self):
+        record = {
+            "status": "graded",
+            "realized_return": 0.0,
+            "as_of_date": "2025-01-02",
+            "horizon_date": "2025-02-03",
+            "outcome_date": "2025-02-03",
+            "entry_price": 100,
+            "probability_up": 40,
+            "baseline_up_rate": 50,
+            "edge_points": -10,
+            "direction": "bearish",
+            "range": {"low": -5, "typical": -2, "high": 3},
+            "evidence_score": 65,
+            "validation_grade": "mixed",
+            "horizon_label": "21 sessions",
+        }
+
+        result = _build_track_record("TEST", [record], [])
+
+        self.assertEqual(result["summary"]["directional_accuracy"], 0)
+        self.assertFalse(result["records"][0]["direction_correct"])
 
     def test_yahoo_bundle_fetches_independent_sources_concurrently(self):
         class ConcurrentProvider(YahooFinanceProvider):

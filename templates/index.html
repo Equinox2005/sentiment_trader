@@ -195,10 +195,60 @@
         </section>
       </div>
 
+      <section class="panel audit-center" id="auditCenter">
+        <div class="panel-heading">
+          <div>
+            <span class="section-number">05 · OPEN THE AUDIT</span>
+            <h3>Every untouched checkpoint, not just one accuracy number</h3>
+            <p class="panel-sub">Five-session evaluation records reveal calibration, where the edge held up, and what a non-overlapping long-or-cash policy would have done.</p>
+          </div>
+          <span class="profile-pill" id="auditFrequency">—</span>
+        </div>
+        <div class="audit-metrics">
+          <div><span>Brier skill vs baseline</span><strong id="auditBrierSkill">—</strong><small>Higher is better</small></div>
+          <div><span>Untouched forecasts</span><strong id="auditSample">—</strong><small id="auditPeriod">—</small></div>
+          <div><span>Independent checks</span><strong id="auditIndependent">—</strong><small>Used for the 95% range</small></div>
+          <div><span>Model / baseline Brier</span><strong id="auditBrier">—</strong><small>Lower is better</small></div>
+        </div>
+        <div class="audit-grid">
+          <div class="audit-block">
+            <h4>Calibration: predicted versus observed</h4>
+            <p>Good probabilities should land near the diagonal, not merely sound confident.</p>
+            <div class="calibration-list" id="calibrationList"></div>
+          </div>
+          <div class="audit-block">
+            <h4>Strategy reality check</h4>
+            <p>Non-overlapping long-or-cash checkpoint windows, before costs.</p>
+            <div class="strategy-summary" id="strategySummary"></div>
+            <svg class="strategy-chart" id="strategyChart" viewBox="0 0 560 190" preserveAspectRatio="none" role="img" aria-label="Historical strategy and buy-and-hold equity curves"></svg>
+            <p class="audit-note" id="strategyNote"></p>
+          </div>
+        </div>
+        <div class="audit-grid audit-breakdowns">
+          <div class="audit-block">
+            <h4>Reliability by analog edge</h4>
+            <div class="audit-table-wrap"><table class="audit-table"><thead><tr><th>Edge</th><th>Checks</th><th>Accuracy</th><th>Brier</th></tr></thead><tbody id="edgeStrataBody"></tbody></table></div>
+          </div>
+          <div class="audit-block">
+            <h4>Reliability by market regime</h4>
+            <div class="audit-table-wrap"><table class="audit-table"><thead><tr><th>Regime</th><th>Checks</th><th>Accuracy</th><th>Avg return</th></tr></thead><tbody id="regimeStrataBody"></tbody></table></div>
+          </div>
+        </div>
+        <details class="evaluation-log">
+          <summary>Inspect the latest untouched evaluation records</summary>
+          <div class="audit-table-wrap">
+            <table class="audit-table evaluation-table">
+              <thead><tr><th>Forecast date</th><th>Odds up</th><th>Edge</th><th>Call</th><th>Actual</th><th>Result</th></tr></thead>
+              <tbody id="evaluationBody"></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
+
       <section class="panel receipts-panel">
         <div class="panel-heading">
           <div>
-            <span class="section-number">05 · INSPECT THE EVIDENCE</span>
+            <span class="section-number">06 · INSPECT THE EVIDENCE</span>
             <h3>The historical twins</h3>
             <p class="panel-sub">Every row is a real, independent setup. Match quality is a distance score—not a probability.</p>
           </div>
@@ -220,6 +270,40 @@
           </table>
         </div>
       </section>
+
+      <div class="two-column proof-tools">
+        <section class="panel time-machine-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">PROVE IT · TIME MACHINE</span>
+              <h3>Rebuild the forecast on a past date</h3>
+              <p class="panel-sub">Playbook cuts off every price and context row after that session, then reveals the outcome only after the forecast is complete.</p>
+            </div>
+          </div>
+          <form class="time-machine-form" id="timeMachineForm">
+            <label for="timeMachineDate">Historical date</label>
+            <div>
+              <input id="timeMachineDate" type="date" required>
+              <button type="submit">Run without hindsight</button>
+            </div>
+          </form>
+          <p class="tool-status" id="timeMachineStatus"></p>
+          <div class="time-machine-result" id="timeMachineResult" hidden></div>
+        </section>
+
+        <section class="panel track-record-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-number">PROVE IT · LIVE TRACK RECORD</span>
+              <h3>Forecasts Playbook can no longer edit</h3>
+              <p class="panel-sub">One audited forecast per completed session. Outcomes are graded only after the full horizon matures.</p>
+            </div>
+          </div>
+          <div class="track-summary" id="trackSummary"></div>
+          <div class="track-record-list" id="trackRecordList"></div>
+          <p class="empty-note" id="trackRecordEmpty">The first audited forecast for this symbol will appear here.</p>
+        </section>
+      </div>
 
       <div class="two-column">
         <section class="panel plan-panel">

@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -228,6 +229,181 @@ class PriceStorageTests(unittest.TestCase):
 
         self.assertEqual(len(service._source_cache), 2)
         self.assertNotIn("aaa", service._source_cache)
+
+    def test_live_forecast_is_immutable_and_graded_by_future_sessions(self):
+        history = price_frame(periods=30)
+        as_of_position = 10
+        as_of_date = history.index[as_of_position].date().isoformat()
+        payload = {
+            "entry_price": float(history["Close"].iloc[as_of_position]) * 4,
+            "probability_up": 62,
+            "analog_probability_up": 62,
+            "baseline_up_rate": 54,
+            "edge_points": 8,
+            "direction": "bullish",
+            "range": {"low": -3, "typical": 4, "high": 9},
+            "evidence_score": 70,
+            "validation_grade": "positive",
+            "horizon_label": "5 sessions",
+            "snapshot_id": "first",
+            "exchange_timezone": "UTC",
+        }
+
+        first = self.store.save_forecast(
+            "AAA",
+            as_of_date,
+            5,
+            "2099-01-01",
+            payload,
+        )
+        changed = dict(payload, probability_up=10, snapshot_id="second")
+        second = self.store.save_forecast(
+            "AAA",
+            as_of_date,
+            5,
+            "2099-01-01",
+            changed,
+        )
+        graded = self.store.grade_pending_forecasts("AAA", history)
+        record = self.store.list_forecasts("AAA")[0]
+
+        expected = (
+            history["Close"].iloc[as_of_position + 5]
+            / history["Close"].iloc[as_of_position]
+            - 1
+        ) * 100
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(graded, 1)
+        self.assertEqual(record["status"], "graded")
+        self.assertEqual(record["probability_up"], 62)
+        self.assertAlmostEqual(record["realized_return"], expected)
+        self.assertEqual(
+            record["outcome_date"],
+            history.index[as_of_position + 5].date().isoformat(),
+        )
+
+    def test_missing_forecast_entry_session_is_not_approximately_graded(self):
+        payload = {
+            "entry_price": 100,
+            "probability_up": 40,
+            "analog_probability_up": 40,
+            "baseline_up_rate": 50,
+            "edge_points": -10,
+            "direction": "bearish",
+            "range": {"low": -8, "typical": -3, "high": 4},
+            "evidence_score": 60,
+            "validation_grade": "mixed",
+            "horizon_label": "5 sessions",
+            "snapshot_id": "missing",
+            "exchange_timezone": "UTC",
+        }
+        self.store.save_forecast(
+            "AAA",
+            "2020-01-02",
+            5,
+            "2024-01-10",
+            payload,
+        )
+
+        graded = self.store.grade_pending_forecasts("AAA", price_frame())
+        record = self.store.list_forecasts("AAA")[0]
+
+        self.assertEqual(graded, 0)
+        self.assertEqual(record["status"], "pending")
+
+    def test_forecast_listing_is_unbounded_unless_limit_is_explicit(self):
+        payload = {
+            "entry_price": 100,
+            "probability_up": 50,
+            "analog_probability_up": 50,
+            "baseline_up_rate": 50,
+            "edge_points": 0,
+            "direction": "neutral",
+            "range": {"low": -2, "typical": 0, "high": 2},
+            "evidence_score": 50,
+            "validation_grade": "mixed",
+            "horizon_label": "5 sessions",
+            "snapshot_id": "list",
+            "exchange_timezone": "UTC",
+        }
+        for day in ("02", "03", "04"):
+            self.store.save_forecast(
+                "BBB",
+                f"2024-01-{day}",
+                5,
+                "2024-01-20",
+                payload,
+            )
+
+        self.assertEqual(len(self.store.list_forecasts("BBB")), 3)
+        self.assertEqual(len(self.store.list_forecasts("BBB", limit=2)), 2)
+
+    def test_in_progress_outcome_session_remains_pending(self):
+        history = price_frame(start="2025-01-02", periods=8)
+        as_of_date = history.index[0].date().isoformat()
+        outcome_date = history.index[5].date().isoformat()
+        payload = {
+            "entry_price": float(history["Close"].iloc[0]),
+            "probability_up": 60,
+            "analog_probability_up": 60,
+            "baseline_up_rate": 50,
+            "edge_points": 10,
+            "direction": "bullish",
+            "range": {"low": -2, "typical": 3, "high": 8},
+            "evidence_score": 70,
+            "validation_grade": "positive",
+            "horizon_label": "5 sessions",
+            "snapshot_id": "open-outcome",
+            "exchange_timezone": "UTC",
+        }
+        self.store.save_forecast(
+            "CCC",
+            as_of_date,
+            5,
+            outcome_date,
+            payload,
+        )
+
+        same_day = datetime.fromisoformat(
+            f"{outcome_date}T20:00:00+00:00"
+        )
+        next_day = same_day + timedelta(days=1)
+
+        self.assertEqual(
+            self.store.grade_pending_forecasts(
+                "CCC",
+                history,
+                now=same_day,
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.store.grade_pending_forecasts(
+                "CCC",
+                history,
+                now=next_day,
+            ),
+            1,
+        )
+
+    def test_schema_initialization_is_safe_across_store_instances(self):
+        path = f"{self.temp.name}\\concurrent.sqlite3"
+        errors = []
+
+        def initialize():
+            try:
+                PlaybookStore(path)
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=initialize) for _ in range(3)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

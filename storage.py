@@ -1,8 +1,12 @@
+import json
 import os
 import sqlite3
 import threading
+import time
+from bisect import bisect_left
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 
@@ -22,13 +26,22 @@ class PlaybookStore:
     def _connect(self):
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
     def _initialize(self):
         with self._lock, closing(self._connect()) as connection:
-            connection.executescript(
+            for attempt in range(20):
+                try:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 19:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS price_bars (
                     symbol TEXT NOT NULL,
@@ -40,15 +53,21 @@ class PlaybookStore:
                     volume REAL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (symbol, session_date)
-                );
-
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS price_cache_meta (
                     symbol TEXT PRIMARY KEY,
                     last_updated_at TEXT NOT NULL,
                     last_full_refresh_at TEXT NOT NULL,
                     generation INTEGER NOT NULL DEFAULT 0
-                );
-
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS forecasts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -58,20 +77,28 @@ class PlaybookStore:
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     realized_return REAL,
+                    realized_price REAL,
+                    outcome_date TEXT,
                     created_at TEXT NOT NULL,
                     graded_at TEXT,
                     UNIQUE(symbol, as_of_date, horizon_days)
-                );
-
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS source_snapshots (
                     snapshot_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     payload BLOB NOT NULL
-                );
-
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS source_snapshots_symbol_created
-                ON source_snapshots(symbol, created_at);
+                ON source_snapshots(symbol, created_at)
                 """
             )
             columns = {
@@ -86,6 +113,20 @@ class PlaybookStore:
                     ALTER TABLE price_cache_meta
                     ADD COLUMN generation INTEGER NOT NULL DEFAULT 0
                     """
+                )
+            forecast_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(forecasts)"
+                ).fetchall()
+            }
+            if "realized_price" not in forecast_columns:
+                connection.execute(
+                    "ALTER TABLE forecasts ADD COLUMN realized_price REAL"
+                )
+            if "outcome_date" not in forecast_columns:
+                connection.execute(
+                    "ALTER TABLE forecasts ADD COLUMN outcome_date TEXT"
                 )
             connection.commit()
 
@@ -293,6 +334,167 @@ class PlaybookStore:
             )
             connection.commit()
 
+    def save_forecast(
+        self,
+        symbol,
+        as_of_date,
+        horizon_days,
+        horizon_date,
+        payload,
+        now=None,
+    ):
+        timestamp = _iso_utc(now)
+        encoded = json.dumps(
+            payload,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        with self._lock, closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO forecasts (
+                    symbol,
+                    as_of_date,
+                    horizon_days,
+                    horizon_date,
+                    payload_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol,
+                    as_of_date,
+                    int(horizon_days),
+                    horizon_date,
+                    encoded,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def grade_pending_forecasts(self, symbol, history, now=None):
+        if history is None or history.empty or "Close" not in history:
+            return 0
+        close = pd.to_numeric(history["Close"], errors="coerce").dropna()
+        if close.empty:
+            return 0
+        dates = [_session_date(value) for value in close.index]
+        values = close.to_numpy(dtype=float)
+        timestamp = _iso_utc(now)
+
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    as_of_date,
+                    horizon_days,
+                    horizon_date,
+                    payload_json
+                FROM forecasts
+                WHERE symbol = ? AND status = 'pending'
+                ORDER BY as_of_date
+                """,
+                (symbol,),
+            ).fetchall()
+            updates = []
+            for row in rows:
+                entry_position = bisect_left(dates, row["as_of_date"])
+                if (
+                    entry_position >= len(dates)
+                    or dates[entry_position] != row["as_of_date"]
+                ):
+                    continue
+                position = entry_position + int(row["horizon_days"])
+                if position >= len(dates):
+                    continue
+                payload = json.loads(row["payload_json"])
+                if not _completed_session_date(
+                    dates[position],
+                    payload.get("exchange_timezone"),
+                    now=now,
+                ):
+                    continue
+                entry_price = float(values[entry_position])
+                realized_price = float(values[position])
+                realized_return = (
+                    (realized_price / entry_price) - 1
+                ) * 100
+                updates.append(
+                    (
+                        realized_return,
+                        realized_price,
+                        dates[position],
+                        timestamp,
+                        row["id"],
+                    )
+                )
+            if updates:
+                connection.executemany(
+                    """
+                    UPDATE forecasts
+                    SET status = 'graded',
+                        realized_return = ?,
+                        realized_price = ?,
+                        outcome_date = ?,
+                        graded_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    updates,
+                )
+            connection.commit()
+        return len(updates)
+
+    def delete_pending_forecast(self, symbol, as_of_date, horizon_days):
+        with self._lock, closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM forecasts
+                WHERE symbol = ?
+                  AND as_of_date = ?
+                  AND horizon_days = ?
+                  AND status = 'pending'
+                """,
+                (symbol, as_of_date, int(horizon_days)),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def list_forecasts(self, symbol, limit=None):
+        query = """
+            SELECT
+                id,
+                symbol,
+                as_of_date,
+                horizon_days,
+                horizon_date,
+                payload_json,
+                status,
+                realized_return,
+                realized_price,
+                outcome_date,
+                created_at,
+                graded_at
+            FROM forecasts
+            WHERE symbol = ?
+            ORDER BY as_of_date DESC, id DESC
+        """
+        parameters = [symbol]
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(int(limit))
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        records = []
+        for row in rows:
+            item = dict(row)
+            payload = json.loads(item.pop("payload_json"))
+            item.update(payload)
+            records.append(item)
+        return records
+
 
 def _price_rows_to_frame(rows):
     if not rows:
@@ -330,3 +532,17 @@ def _iso_utc(value=None):
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _completed_session_date(session_date, timezone_name, now=None):
+    if not timezone_name:
+        return False
+    try:
+        market_timezone = ZoneInfo(timezone_name)
+    except (TypeError, ZoneInfoNotFoundError):
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local_date = current.astimezone(market_timezone).date()
+    return date.fromisoformat(session_date) < local_date

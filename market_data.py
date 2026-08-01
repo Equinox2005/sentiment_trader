@@ -9,6 +9,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import yfinance as yf
@@ -21,6 +22,10 @@ SYMBOL_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,11}$")
 
 
 class InvalidSymbolError(ValueError):
+    pass
+
+
+class InvalidDateError(ValueError):
     pass
 
 
@@ -427,6 +432,8 @@ class MarketIntelligenceService:
             include_validation=include_validation,
             snapshot_id=snapshot_id,
         )
+        if include_validation:
+            self._record_live_forecast(symbol, history, result)
         self._store_cached(cache_key, result, request_version)
         return copy.deepcopy(result)
 
@@ -541,6 +548,197 @@ class MarketIntelligenceService:
             snapshot_id=snapshot_id,
         )
 
+    def analyze_as_of(self, raw_symbol, as_of_date, force_refresh=False):
+        symbol = normalize_symbol(raw_symbol)
+        requested_date = _parse_as_of_date(as_of_date)
+        try:
+            source = self.provider.fetch(
+                symbol,
+                force_refresh=force_refresh,
+            )
+        except MarketDataError:
+            raise
+        except Exception as exc:
+            raise MarketDataError(
+                "Market research is temporarily unavailable. Please try again."
+            ) from exc
+
+        history, profile, _news, warnings, context = copy.deepcopy(source)
+        history = history.sort_index()
+        valid_close = pd.to_numeric(
+            history["Close"],
+            errors="coerce",
+        ).notna()
+        history = history.loc[valid_close]
+        session_dates = [
+            pd.Timestamp(value).date()
+            for value in history.index
+        ]
+        eligible = [
+            position
+            for position, session_date in enumerate(session_dates)
+            if session_date <= requested_date
+        ]
+        if not eligible:
+            raise InvalidDateError(
+                "Choose a date within this symbol's available price history."
+            )
+        position = eligible[-1]
+        if position == len(history) - 1 and requested_date > session_dates[-1]:
+            raise InvalidDateError(
+                "Time Machine dates cannot be later than the latest market session."
+            )
+
+        historical_history = history.iloc[: position + 1].copy()
+        historical_context = _frame_through_date(context, session_dates[position])
+        historical_profile = {
+            key: value
+            for key, value in profile.items()
+            if not key.startswith("earningsTimestamp")
+        }
+        historical_warnings = list(warnings)
+        historical_warnings.append(
+            "Historical headlines are unavailable, so this replay uses price and "
+            "market context only."
+        )
+        result = _build_analysis(
+            symbol=symbol,
+            history=historical_history,
+            profile=historical_profile,
+            news=[],
+            warnings=historical_warnings,
+            context=historical_context,
+            include_validation=True,
+            snapshot_id=f"as-of:{session_dates[position].isoformat()}",
+        )
+        result["stage"] = "time_machine"
+        result["as_of"] = session_dates[position].isoformat()
+        result["methodology"] = (
+            "Time Machine ran the same analog engine on a history cut off after "
+            f"{session_dates[position].isoformat()}. No later price, context, "
+            "outcome, or current headline was available to the forecast."
+        )
+
+        outcome = {
+            "available": False,
+            "reason": "The selected forecast horizon has not completed yet.",
+        }
+        play = result.get("playbook", {})
+        if play.get("available"):
+            horizon = int(play["forecast"]["horizon_days"])
+            outcome_position = position + horizon
+            if outcome_position < len(history):
+                entry = float(history["Close"].iloc[position])
+                exit_price = float(history["Close"].iloc[outcome_position])
+                realized_return = (exit_price / entry - 1) * 100
+                direction = play["verdict"]["direction"]
+                direction_correct = (
+                    realized_return > 0
+                    if direction == "bullish"
+                    else realized_return < 0
+                    if direction == "bearish"
+                    else None
+                )
+                outcome = {
+                    "available": True,
+                    "date": session_dates[outcome_position].isoformat(),
+                    "realized_return": round(realized_return, 2),
+                    "actual_up": realized_return > 0,
+                    "probability_correct": (
+                        play["forecast"]["probability_up"] >= 50
+                    ) == (realized_return > 0),
+                    "direction_correct": direction_correct,
+                }
+        result["time_machine"] = {
+            "requested_date": requested_date.isoformat(),
+            "session_date": session_dates[position].isoformat(),
+            "future_data_used": False,
+            "outcome": outcome,
+        }
+        return result
+
+    def track_record(self, raw_symbol, force_refresh=False):
+        symbol = normalize_symbol(raw_symbol)
+        store = getattr(self.provider, "store", None)
+        if store is None:
+            return {
+                "symbol": symbol,
+                "available": False,
+                "reason": "Persistent forecast storage is not configured.",
+                "records": [],
+            }
+        warnings = []
+        if force_refresh:
+            try:
+                history, _profile, _news, warnings, _context = self.provider.fetch(
+                    symbol,
+                    force_refresh=True,
+                )
+            except MarketDataError:
+                raise
+            except Exception as exc:
+                raise MarketDataError(
+                    "Market research is temporarily unavailable. Please try again."
+                ) from exc
+            store.grade_pending_forecasts(symbol, history)
+        records = store.list_forecasts(symbol)
+        return _build_track_record(symbol, records, warnings)
+
+    def _record_live_forecast(self, symbol, history, result):
+        store = getattr(self.provider, "store", None)
+        play = result.get("playbook", {})
+        if store is None or not play.get("available"):
+            return
+        store.grade_pending_forecasts(symbol, history)
+        forecast = play["forecast"]
+        as_of_date = _date_string(history.index[-1])
+        horizon_days = int(forecast["horizon_days"])
+        exchange_timezone = (
+            result.get("exchange_timezone")
+            or _index_timezone(history.index)
+        )
+        if not exchange_timezone:
+            result["warnings"].append(
+                "The live forecast ledger was deferred because the market "
+                "timezone could not be verified."
+            )
+            return
+        if not _session_is_complete(
+            history.index[-1],
+            timezone_name=exchange_timezone,
+        ):
+            store.delete_pending_forecast(
+                symbol,
+                as_of_date,
+                horizon_days,
+            )
+            return
+        start = pd.Timestamp(as_of_date)
+        if forecast["sampling"] == "calendar_daily":
+            horizon_date = start + pd.Timedelta(days=horizon_days)
+        else:
+            horizon_date = start + pd.offsets.BDay(horizon_days)
+        store.save_forecast(
+            symbol=symbol,
+            as_of_date=as_of_date,
+            horizon_days=horizon_days,
+            horizon_date=horizon_date.date().isoformat(),
+            payload={
+                "entry_price": float(history["Close"].iloc[-1]),
+                "probability_up": forecast["probability_up"],
+                "analog_probability_up": forecast["analog_probability_up"],
+                "baseline_up_rate": forecast["baseline_up_rate"],
+                "edge_points": forecast["edge_points"],
+                "direction": play["verdict"]["direction"],
+                "range": forecast["range_21d"],
+                "evidence_score": forecast["evidence_score"],
+                "validation_grade": play["validation"].get("grade"),
+                "horizon_label": forecast["horizon_label"],
+                "snapshot_id": result["snapshot_id"],
+                "exchange_timezone": exchange_timezone,
+            },
+        )
+
     def _begin_request(self, cache_key):
         with self._cache_lock:
             self._request_counter += 1
@@ -649,6 +847,7 @@ def _build_analysis(
         "stage": "audit" if include_validation else "quick",
         "name": display_name,
         "exchange": profile.get("exchange") or profile.get("fullExchangeName") or "",
+        "exchange_timezone": profile.get("exchangeTimezoneName") or "",
         "sector": profile.get("sector") or profile.get("quoteType") or "Market asset",
         "currency": profile.get("currency") or "USD",
         "as_of": datetime.now(timezone.utc).isoformat(),
@@ -750,6 +949,167 @@ def _build_story_check(play, narrative_score, news_count):
         ),
     )
     return {"state": state, "news_lean": news_lean, "summary": summary}
+
+
+def _parse_as_of_date(value):
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise InvalidDateError("Enter a Time Machine date as YYYY-MM-DD.")
+    try:
+        parsed = pd.Timestamp(text)
+    except (TypeError, ValueError) as exc:
+        raise InvalidDateError("Enter a valid Time Machine date.") from exc
+    if pd.isna(parsed):
+        raise InvalidDateError("Enter a valid Time Machine date.")
+    return parsed.date()
+
+
+def _frame_through_date(frame, target_date):
+    if frame is None:
+        return None
+    if frame.empty:
+        return frame.copy()
+    ordered = frame.sort_index()
+    positions = [
+        position
+        for position, value in enumerate(ordered.index)
+        if pd.Timestamp(value).date() <= target_date
+    ]
+    if not positions:
+        return ordered.iloc[:0].copy()
+    return ordered.iloc[: positions[-1] + 1].copy()
+
+
+def _index_timezone(index):
+    timezone_value = getattr(index, "tz", None)
+    return str(timezone_value) if timezone_value is not None else ""
+
+
+def _session_is_complete(value, timezone_name=None, now=None):
+    session = pd.Timestamp(value)
+    current = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+    if timezone_name:
+        try:
+            market_timezone = ZoneInfo(timezone_name)
+        except (TypeError, ZoneInfoNotFoundError):
+            return False
+        if current.tzinfo is None:
+            current = current.tz_localize("UTC")
+        current = current.tz_convert(market_timezone)
+    elif session.tzinfo is not None:
+        if current.tzinfo is None:
+            current = current.tz_localize("UTC")
+        current = current.tz_convert(session.tz)
+    else:
+        return False
+    return session.date() < current.date()
+
+
+def _build_track_record(symbol, records, warnings):
+    public_records = []
+    for record in records:
+        graded = record["status"] == "graded"
+        realized_return = (
+            float(record["realized_return"])
+            if graded and record["realized_return"] is not None
+            else None
+        )
+        actual_up = realized_return > 0 if realized_return is not None else None
+        probability_correct = (
+            (float(record["probability_up"]) >= 50) == actual_up
+            if actual_up is not None
+            else None
+        )
+        direction = record["direction"]
+        direction_correct = (
+            realized_return > 0
+            if direction == "bullish" and realized_return is not None
+            else realized_return < 0
+            if direction == "bearish" and realized_return is not None
+            else None
+        )
+        public_records.append(
+            {
+                "as_of_date": record["as_of_date"],
+                "horizon_date": record["horizon_date"],
+                "outcome_date": record["outcome_date"],
+                "status": record["status"],
+                "entry_price": round(float(record["entry_price"]), 4),
+                "probability_up": float(record["probability_up"]),
+                "baseline_up_rate": float(record["baseline_up_rate"]),
+                "edge_points": float(record["edge_points"]),
+                "direction": direction,
+                "range": record["range"],
+                "evidence_score": int(record["evidence_score"]),
+                "validation_grade": record["validation_grade"],
+                "horizon_label": record["horizon_label"],
+                "realized_return": (
+                    round(realized_return, 2)
+                    if realized_return is not None
+                    else None
+                ),
+                "probability_correct": probability_correct,
+                "direction_correct": direction_correct,
+            }
+        )
+
+    graded = [
+        item for item in public_records
+        if item["status"] == "graded"
+    ]
+    directional = [
+        item for item in graded
+        if item["direction"] in {"bullish", "bearish"}
+    ]
+    brier = (
+        sum(
+            (
+                item["probability_up"] / 100
+                - float(item["realized_return"] > 0)
+            ) ** 2
+            for item in graded
+        ) / len(graded)
+        if graded
+        else None
+    )
+    return {
+        "symbol": symbol,
+        "available": bool(records),
+        "summary": {
+            "total": len(public_records),
+            "graded": len(graded),
+            "pending": len(public_records) - len(graded),
+            "probability_accuracy": (
+                round(
+                    sum(item["probability_correct"] for item in graded)
+                    / len(graded)
+                    * 100
+                )
+                if graded
+                else None
+            ),
+            "directional_calls": len(directional),
+            "directional_accuracy": (
+                round(
+                    sum(item["direction_correct"] for item in directional)
+                    / len(directional)
+                    * 100
+                )
+                if directional
+                else None
+            ),
+            "brier": round(brier, 3) if brier is not None else None,
+        },
+        "records": public_records[:100],
+        "records_shown": min(100, len(public_records)),
+        "records_truncated": len(public_records) > 100,
+        "warnings": warnings,
+        "note": (
+            "Live forecasts are stored once per completed market session and "
+            "graded after the exact configured number of future sessions. "
+            "Pending forecasts are never treated as wins or losses."
+        ),
+    }
 
 
 def _profile_earnings_at(profile):
@@ -988,6 +1348,7 @@ def _frame_payload(frame):
         )
     return {
         "index": [_date_string(value) for value in frame.index],
+        "timezone": _index_timezone(frame.index),
         "columns": columns,
         "data": data,
     }
@@ -995,7 +1356,16 @@ def _frame_payload(frame):
 
 def _frame_from_payload(payload):
     frame = pd.DataFrame(payload["data"], columns=payload["columns"])
-    frame.index = pd.to_datetime(payload["index"], utc=True)
+    index = pd.to_datetime(payload["index"])
+    timezone_name = payload.get("timezone")
+    if timezone_name:
+        try:
+            index = index.tz_localize(ZoneInfo(timezone_name))
+        except (TypeError, ZoneInfoNotFoundError):
+            index = index.tz_localize("UTC")
+    else:
+        index = index.tz_localize("UTC")
+    frame.index = index
     return frame
 
 

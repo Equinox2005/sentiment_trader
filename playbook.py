@@ -24,6 +24,8 @@ GHOST_PATHS = 12
 MAX_HISTORY_DAYS = 366 * 20
 PRIOR_STRENGTH = 6.0
 MAX_NEWS_ADJUSTMENT = 5.0
+EVALUATION_STEP = 5
+MAX_EVALUATION_RECORDS = 260
 
 
 FEATURE_LABELS = {
@@ -507,16 +509,14 @@ def _prepare_matrices(frame, features, shapes):
 
 def _select_weight_profile(frame, features, shapes, config, prepared=None):
     prepared = prepared or _prepare_matrices(frame, features, shapes)
-    anchors = _validation_anchors(len(frame), config)
-    if len(anchors) < 10:
+    tuning, _evaluation = _audit_anchors(len(frame), config)
+    if len(tuning) < 5:
         return "balanced", {
-            "tuning_forecasts": len(anchors),
+            "tuning_forecasts": len(tuning),
             "profiles_tested": 1,
             "reason": "Not enough older checkpoints to tune weights safely.",
         }
 
-    split = max(5, len(anchors) // 2)
-    tuning = anchors[:split]
     scores = {}
     for profile_key in WEIGHT_PROFILES:
         predictions = _historical_predictions(
@@ -537,6 +537,10 @@ def _select_weight_profile(frame, features, shapes, config, prepared=None):
             key: round(value, 4) if value is not None else None
             for key, value in scores.items()
         },
+        "tuning_period": {
+            "start": _date_string(frame.index[tuning[0]]),
+            "end": _date_string(frame.index[tuning[-1]]),
+        },
     }
 
 
@@ -544,9 +548,7 @@ def _walk_forward_validation(
     frame, features, shapes, profile_key, selection, config, prepared=None
 ):
     prepared = prepared or _prepare_matrices(frame, features, shapes)
-    anchors = _validation_anchors(len(frame), config)
-    split = max(5, len(anchors) // 2)
-    evaluation = anchors[split:] if len(anchors) >= 10 else []
+    _tuning, evaluation = _audit_anchors(len(frame), config)
     predictions = _historical_predictions(
         frame, features, shapes, profile_key, evaluation, config, prepared
     )
@@ -580,7 +582,17 @@ def _walk_forward_validation(
     ) / len(predictions)
     accuracy = correct / len(predictions)
     baseline_accuracy = baseline_correct / len(predictions)
-    interval = _wilson_interval(correct, len(predictions))
+    independent = _non_overlapping_predictions(predictions, config)
+    independent_correct = sum(
+        (item["probability_up"] >= 0.5) == item["actual_up"]
+        for item in independent
+    )
+    interval = _wilson_interval(independent_correct, len(independent))
+    brier_skill = (
+        (1 - model_brier / baseline_brier) * 100
+        if baseline_brier > 1e-12
+        else 0.0
+    )
 
     if len(predictions) < 12:
         grade = "limited"
@@ -600,6 +612,7 @@ def _walk_forward_validation(
         "grade": grade,
         "label": label,
         "sample_size": len(predictions),
+        "independent_sample_size": len(independent),
         "correct": correct,
         "accuracy": round(accuracy * 100),
         "accuracy_low": round(interval[0] * 100),
@@ -607,21 +620,64 @@ def _walk_forward_validation(
         "baseline_accuracy": round(baseline_accuracy * 100),
         "brier": round(model_brier, 3),
         "baseline_brier": round(baseline_brier, 3),
+        "brier_skill": round(brier_skill, 1),
         "actionable_count": len(actionable),
         "actionable_accuracy": (
             round(actionable_correct / len(actionable) * 100)
             if actionable else None
         ),
+        "evaluation_frequency_sessions": EVALUATION_STEP,
+        "evaluation_period": {
+            "start": _date_string(frame.index[evaluation[0]]),
+            "end": _date_string(
+                frame.index[evaluation[-1] + config["horizon_days"]]
+            ),
+        },
+        "calibration": _calibration_buckets(predictions),
+        "edge_strata": _prediction_strata(
+            predictions,
+            (
+                ("Under 4 pts", lambda item: abs(item["edge"]) < 0.04),
+                (
+                    "4-8 pts",
+                    lambda item: 0.04 <= abs(item["edge"]) < 0.08,
+                ),
+                ("8+ pts", lambda item: abs(item["edge"]) >= 0.08),
+            ),
+        ),
+        "regime_strata": _prediction_strata(
+            predictions,
+            tuple(
+                (
+                    label,
+                    lambda item, expected=label: (
+                        item["regime"]["trend"] == expected
+                    ),
+                )
+                for label in ("Uptrend", "Transition", "Downtrend")
+            ),
+        ),
+        "strategy": _strategy_audit(predictions, config, frame),
+        "records": [
+            _public_evaluation_record(item)
+            for item in predictions
+        ],
         "selection": selection,
         "explanation": (
             "Each checkpoint used only information available on that date. "
-            "Weight tuning used older checkpoints; these results use the newer "
-            "untouched checkpoints."
+            "Weight tuning used an older period; these five-session records use "
+            "the newer untouched period. Because adjacent outcomes overlap, the "
+            "95% accuracy range uses only non-overlapping checkpoints."
         ),
     }
 
 
 def _validation_anchors(length, config):
+    tuning, evaluation = _audit_anchors(length, config)
+    return tuning + evaluation
+
+
+def _audit_anchors(length, config):
     first = (
         config["warmup"]
         + config["recent_exclusion"]
@@ -629,9 +685,25 @@ def _validation_anchors(length, config):
     )
     last = length - config["horizon_days"] - 1
     if last <= first:
-        return []
-    anchors = list(range(first, last + 1, config["spacing"]))
-    return anchors[-40:]
+        return [], []
+
+    minimum_evaluation_span = (
+        config["horizon_days"] + EVALUATION_STEP * 12
+    )
+    latest_split = last - minimum_evaluation_span
+    if latest_split <= first:
+        return [], []
+    available_span = last - first
+    split = min(
+        first + max(config["spacing"] * 5, round(available_span * 0.4)),
+        latest_split,
+    )
+    tuning = list(range(first, split + 1, config["spacing"]))[-30:]
+    evaluation_start = split + config["horizon_days"]
+    evaluation = list(
+        range(evaluation_start, last + 1, EVALUATION_STEP)
+    )[-MAX_EVALUATION_RECORDS:]
+    return tuning, evaluation
 
 
 def _historical_predictions(
@@ -662,16 +734,230 @@ def _historical_predictions(
         ) * 100
         predictions.append(
             {
+                "position": target_position,
+                "date": frame.index[target_position],
+                "horizon_date": frame.index[
+                    target_position + config["horizon_days"]
+                ],
                 "probability_up": summary["analog_probability_up"] / 100,
                 "baseline_up_rate": summary["baseline_up_rate"] / 100,
                 "edge": (
                     summary["analog_probability_up"] - summary["baseline_up_rate"]
                 ) / 100,
                 "median_return": summary["public"]["median_21d"],
+                "actual_return": actual_return,
                 "actual_up": actual_return > 0,
+                "regime": _classify_regime(features.iloc[target_position]),
+                "match_count": summary["public"]["count"],
+                "effective_matches": summary["public"]["effective_matches"],
             }
         )
     return predictions
+
+
+def _non_overlapping_predictions(predictions, config):
+    selected = []
+    next_position = -1
+    for item in predictions:
+        if item["position"] < next_position:
+            continue
+        selected.append(item)
+        next_position = item["position"] + config["horizon_days"]
+    return selected
+
+
+def _calibration_buckets(predictions):
+    buckets = (
+        ("Under 40%", 0.0, 0.4),
+        ("40-50%", 0.4, 0.5),
+        ("50-60%", 0.5, 0.6),
+        ("60%+", 0.6, 1.000001),
+    )
+    result = []
+    for label, low, high in buckets:
+        items = [
+            item
+            for item in predictions
+            if low <= item["probability_up"] < high
+        ]
+        if not items:
+            continue
+        predicted = sum(item["probability_up"] for item in items) / len(items)
+        observed = sum(item["actual_up"] for item in items) / len(items)
+        result.append(
+            {
+                "label": label,
+                "count": len(items),
+                "predicted_up": round(predicted * 100, 1),
+                "observed_up": round(observed * 100, 1),
+                "gap_points": round((predicted - observed) * 100, 1),
+            }
+        )
+    return result
+
+
+def _prediction_strata(predictions, definitions):
+    result = []
+    for label, predicate in definitions:
+        items = [item for item in predictions if predicate(item)]
+        if not items:
+            continue
+        correct = sum(
+            (item["probability_up"] >= 0.5) == item["actual_up"]
+            for item in items
+        )
+        brier = _brier_score(items)
+        result.append(
+            {
+                "label": label,
+                "count": len(items),
+                "accuracy": round(correct / len(items) * 100),
+                "brier": round(brier, 3),
+                "average_edge_points": round(
+                    sum(abs(item["edge"]) for item in items)
+                    / len(items)
+                    * 100,
+                    1,
+                ),
+                "average_return": round(
+                    sum(item["actual_return"] for item in items)
+                    / len(items),
+                    2,
+                ),
+            }
+        )
+    return result
+
+
+def _historical_signal(item):
+    if item["edge"] >= 0.04 and item["median_return"] > 0.5:
+        return "bullish"
+    if item["edge"] <= -0.04 and item["median_return"] < -0.5:
+        return "bearish"
+    return "neutral"
+
+
+def _strategy_audit(predictions, config, frame):
+    periods = _non_overlapping_predictions(predictions, config)
+    if not periods:
+        return {
+            "available": False,
+            "periods": 0,
+            "trades": 0,
+            "curve": [],
+            "hold_curve": [],
+        }
+
+    start_position = periods[0]["position"]
+    end_position = (
+        periods[-1]["position"] + config["horizon_days"]
+    )
+    close = frame["Close"].to_numpy(dtype=float)
+    held = np.zeros(end_position - start_position + 1, dtype=bool)
+    trades = 0
+    wins = 0
+    for item in periods:
+        if _historical_signal(item) != "bullish":
+            continue
+        trades += 1
+        wins += item["actual_return"] > 0
+        interval_start = item["position"] - start_position + 1
+        interval_end = (
+            item["position"]
+            - start_position
+            + config["horizon_days"]
+            + 1
+        )
+        held[interval_start:interval_end] = True
+
+    strategy_equity = 100.0
+    start_date = _date_string(frame.index[start_position])
+    strategy_curve = [{"date": start_date, "value": 100.0}]
+    hold_curve = [{"date": start_date, "value": 100.0}]
+    for position in range(start_position + 1, end_position + 1):
+        offset = position - start_position
+        daily_return = close[position] / close[position - 1] - 1
+        if held[offset]:
+            strategy_equity *= 1 + daily_return
+        hold_equity = close[position] / close[start_position] * 100
+        date = _date_string(frame.index[position])
+        strategy_curve.append(
+            {"date": date, "value": round(strategy_equity, 2)}
+        )
+        hold_curve.append({"date": date, "value": round(hold_equity, 2)})
+
+    hold_equity = hold_curve[-1]["value"]
+    strategy_drawdown = _curve_drawdown(strategy_curve)
+    hold_drawdown = _curve_drawdown(hold_curve)
+    return {
+        "available": True,
+        "periods": len(periods),
+        "trades": trades,
+        "trade_win_rate": round(wins / trades * 100) if trades else None,
+        "exposure": round(float(held[1:].mean()) * 100),
+        "strategy_return": round(strategy_equity - 100, 1),
+        "hold_return": round(hold_equity - 100, 1),
+        "excess_return": round(strategy_equity - hold_equity, 1),
+        "max_drawdown": strategy_drawdown,
+        "hold_max_drawdown": hold_drawdown,
+        "curve": _downsample_curve(strategy_curve),
+        "hold_curve": _downsample_curve(hold_curve),
+        "note": (
+            "Daily mark-to-market, non-overlapping long-or-cash signals versus "
+            "continuous buy-and-hold; excludes fees, spreads, and taxes."
+        ),
+    }
+
+
+def _curve_drawdown(curve):
+    peak = 100.0
+    worst = 0.0
+    for point in curve:
+        value = point["value"]
+        peak = max(peak, value)
+        if peak:
+            worst = min(worst, (value / peak - 1) * 100)
+    return round(worst, 1)
+
+
+def _downsample_curve(curve, max_points=120):
+    if len(curve) <= max_points:
+        return curve
+    positions = np.linspace(
+        0,
+        len(curve) - 1,
+        max_points,
+        dtype=int,
+    )
+    return [curve[position] for position in np.unique(positions)]
+
+
+def _public_evaluation_record(item):
+    signal = _historical_signal(item)
+    if signal == "bullish":
+        signal_correct = item["actual_return"] > 0
+    elif signal == "bearish":
+        signal_correct = item["actual_return"] < 0
+    else:
+        signal_correct = None
+    return {
+        "date": _date_string(item["date"]),
+        "horizon_date": _date_string(item["horizon_date"]),
+        "probability_up": round(item["probability_up"] * 100, 1),
+        "baseline_up_rate": round(item["baseline_up_rate"] * 100, 1),
+        "edge_points": round(item["edge"] * 100, 1),
+        "median_return": round(item["median_return"], 2),
+        "actual_return": round(item["actual_return"], 2),
+        "actual_up": item["actual_up"],
+        "probability_correct": (
+            (item["probability_up"] >= 0.5) == item["actual_up"]
+        ),
+        "signal": signal,
+        "signal_correct": signal_correct,
+        "regime": item["regime"]["label"],
+        "match_count": item["match_count"],
+        "effective_matches": item["effective_matches"],
+    }
 
 
 def _rank_matches_batch(

@@ -23,6 +23,20 @@ class StubService:
             "snapshot_id": snapshot_id,
         }
 
+    def analyze_as_of(self, symbol, as_of_date, force_refresh=False):
+        return {
+            "symbol": symbol.upper(),
+            "stage": "time_machine",
+            "as_of": as_of_date,
+        }
+
+    def track_record(self, symbol, force_refresh=False):
+        return {
+            "symbol": symbol.upper(),
+            "available": False,
+            "records": [],
+        }
+
 
 class AppTests(unittest.TestCase):
     def setUp(self):
@@ -70,6 +84,20 @@ class AppTests(unittest.TestCase):
         self.assertEqual(missing.get_json()["code"], "missing_snapshot")
         self.assertEqual(refresh.status_code, 400)
         self.assertEqual(refresh.get_json()["code"], "unsupported_refresh")
+
+    def test_time_machine_and_track_record_endpoints(self):
+        missing = self.client.get("/api/analyze/AAPL/as-of")
+        replay = self.client.get(
+            "/api/analyze/AAPL/as-of?date=2024-06-03"
+        )
+        track = self.client.get("/api/track-record/AAPL")
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.get_json()["code"], "missing_date")
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.get_json()["stage"], "time_machine")
+        self.assertEqual(track.status_code, 200)
+        self.assertEqual(track.get_json()["symbol"], "AAPL")
 
     def test_homepage_renders_product(self):
         response = self.client.get("/")

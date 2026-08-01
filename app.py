@@ -3,6 +3,7 @@ import os
 from flask import Flask, jsonify, render_template, request
 
 from market_data import (
+    InvalidDateError,
     InvalidSymbolError,
     MarketDataError,
     MarketIntelligenceService,
@@ -93,9 +94,46 @@ def create_app(service=None):
             refresh,
         )
 
+    @app.get("/api/analyze/<symbol>/as-of")
+    def analyze_as_of(symbol):
+        refresh = request.args.get("refresh") == "1"
+        as_of_date = request.args.get("date")
+        if not as_of_date:
+            return (
+                jsonify(
+                    {
+                        "error": "Choose a Time Machine date.",
+                        "code": "missing_date",
+                    }
+                ),
+                400,
+            )
+        return _analysis_response(
+            lambda value, force_refresh=False: app.extensions[
+                "market_service"
+            ].analyze_as_of(
+                value,
+                as_of_date=as_of_date,
+                force_refresh=force_refresh,
+            ),
+            symbol,
+            refresh,
+        )
+
+    @app.get("/api/track-record/<symbol>")
+    def track_record(symbol):
+        refresh = request.args.get("refresh") == "1"
+        return _analysis_response(
+            app.extensions["market_service"].track_record,
+            symbol,
+            refresh,
+        )
+
     def _analysis_response(method, symbol, refresh):
         try:
             result = method(symbol, force_refresh=refresh)
+        except InvalidDateError as exc:
+            return jsonify({"error": str(exc), "code": "invalid_date"}), 400
         except InvalidSymbolError as exc:
             return jsonify({"error": str(exc), "code": "invalid_symbol"}), 400
         except MarketDataError as exc:

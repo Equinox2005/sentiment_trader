@@ -1,6 +1,8 @@
 const state = {
   analysis: null,
   request: null,
+  trackRequest: null,
+  timeRequest: null,
   showAllReceipts: false,
   watchlist: readStoredList(),
 };
@@ -74,10 +76,17 @@ async function loadSymbol(rawSymbol) {
   }
 
   if (state.request) state.request.abort();
+  if (state.trackRequest) state.trackRequest.abort();
+  if (state.timeRequest) state.timeRequest.abort();
   const controller = new AbortController();
   state.request = controller;
   $("statusMessage").textContent = "";
   $("symbolInput").value = symbol;
+  $("trackSummary").replaceChildren();
+  $("trackRecordList").replaceChildren();
+  $("trackRecordEmpty").hidden = false;
+  $("timeMachineResult").hidden = true;
+  $("timeMachineStatus").textContent = "";
   startLoading();
   let quickRendered = false;
 
@@ -121,6 +130,7 @@ async function loadSymbol(rawSymbol) {
     state.analysis = audited;
     setLoadingStage("Calibrating evidence and finalizing the forecast…", 94);
     render(audited);
+    loadTrackRecord(audited.symbol);
   } catch (error) {
     if (error.name !== "AbortError" && state.request === controller) {
       $("statusMessage").textContent = quickRendered
@@ -149,6 +159,7 @@ function render(data) {
     renderFingerprint(play);
     renderRange(play);
     renderReliability(play.validation);
+    renderAudit(play.validation);
     renderReceipts(play);
     renderPlan(data);
     renderCatalyst(play.catalyst);
@@ -159,6 +170,7 @@ function render(data) {
   renderStory(data.story);
   renderNews(data);
   renderChart();
+  setTimeMachineBounds(data);
   updateWatchButton();
   const warnings = data.warnings.length
     ? ` Data notes: ${data.warnings.join(" ")}`
@@ -302,6 +314,178 @@ function renderReliability(validation) {
   $("validationNote").textContent = validation.explanation + actionable;
 }
 
+function renderAudit(validation) {
+  if (!validation.available) {
+    $("auditFrequency").textContent = validation.pending ? "Audit running" : "Unavailable";
+    ["auditBrierSkill", "auditSample", "auditIndependent", "auditBrier"]
+      .forEach((id) => { $(id).textContent = "—"; });
+    $("auditPeriod").textContent = validation.reason || "No evaluation period";
+    $("calibrationList").replaceChildren();
+    $("strategySummary").replaceChildren();
+    $("strategyChart").replaceChildren();
+    $("strategyNote").textContent = validation.reason || "";
+    $("edgeStrataBody").replaceChildren();
+    $("regimeStrataBody").replaceChildren();
+    $("evaluationBody").replaceChildren();
+    return;
+  }
+
+  $("auditFrequency").textContent =
+    `Every ${validation.evaluation_frequency_sessions} sessions`;
+  $("auditBrierSkill").textContent =
+    `${validation.brier_skill >= 0 ? "+" : ""}${validation.brier_skill}%`;
+  $("auditBrierSkill").className = tone(validation.brier_skill);
+  $("auditSample").textContent = String(validation.sample_size);
+  $("auditIndependent").textContent = String(validation.independent_sample_size);
+  $("auditBrier").textContent =
+    `${Number(validation.brier).toFixed(3)} / ${Number(validation.baseline_brier).toFixed(3)}`;
+  $("auditPeriod").textContent =
+    `${formatDate(validation.evaluation_period.start)} – ${formatDate(validation.evaluation_period.end)}`;
+
+  $("calibrationList").replaceChildren(...validation.calibration.map((bucket) => {
+    const row = document.createElement("div");
+    row.className = "calibration-row";
+    const heading = document.createElement("div");
+    const label = document.createElement("strong");
+    label.textContent = bucket.label;
+    const count = document.createElement("span");
+    count.textContent = `${bucket.count} checks`;
+    heading.append(label, count);
+    const bars = document.createElement("div");
+    bars.className = "calibration-bars";
+    const predicted = document.createElement("i");
+    predicted.style.width = `${bucket.predicted_up}%`;
+    predicted.title = `Predicted ${bucket.predicted_up}%`;
+    const observed = document.createElement("b");
+    observed.style.width = `${bucket.observed_up}%`;
+    observed.title = `Observed ${bucket.observed_up}%`;
+    bars.append(predicted, observed);
+    const values = document.createElement("small");
+    values.textContent =
+      `${bucket.predicted_up}% predicted · ${bucket.observed_up}% observed · ` +
+      `${bucket.gap_points >= 0 ? "+" : ""}${bucket.gap_points} pt gap`;
+    row.append(heading, bars, values);
+    return row;
+  }));
+
+  renderStrategyAudit(validation.strategy);
+  renderStrataTable("edgeStrataBody", validation.edge_strata, false);
+  renderStrataTable("regimeStrataBody", validation.regime_strata, true);
+  renderEvaluationRecords(validation.records);
+}
+
+function renderStrategyAudit(strategy) {
+  if (!strategy?.available) {
+    $("strategySummary").replaceChildren();
+    $("strategyChart").replaceChildren();
+    $("strategyNote").textContent = "Not enough non-overlapping checkpoints.";
+    return;
+  }
+  const facts = [
+    ["Long/cash", pct(strategy.strategy_return)],
+    ["Buy and hold", pct(strategy.hold_return)],
+    ["Excess", pct(strategy.excess_return)],
+    ["Max drawdown", pct(strategy.max_drawdown)],
+    ["Long signals", `${strategy.trades} / ${strategy.periods}`],
+    ["Signal win rate", strategy.trade_win_rate === null ? "—" : `${strategy.trade_win_rate}%`],
+  ];
+  $("strategySummary").replaceChildren(...facts.map(([label, value]) => {
+    const item = document.createElement("div");
+    const key = document.createElement("span");
+    const result = document.createElement("strong");
+    key.textContent = label;
+    result.textContent = value;
+    item.append(key, result);
+    return item;
+  }));
+  $("strategyNote").textContent = strategy.note;
+  renderEquityChart(strategy);
+}
+
+function renderEquityChart(strategy) {
+  const svg = $("strategyChart");
+  const strategyValues = strategy.curve.map((point) => Number(point.value));
+  const holdValues = strategy.hold_curve.map((point) => Number(point.value));
+  const values = [...strategyValues, ...holdValues];
+  if (values.length < 2) {
+    svg.replaceChildren();
+    return;
+  }
+  const width = 560;
+  const height = 190;
+  const pad = 12;
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const spread = maximum - minimum || 1;
+  const x = (index, count) => pad + index / Math.max(1, count - 1) * (width - pad * 2);
+  const y = (value) => pad + (maximum - value) / spread * (height - pad * 2);
+  const path = (series) => series.map((value, index) =>
+    `${index ? "L" : "M"}${x(index, series.length).toFixed(1)},${y(value).toFixed(1)}`)
+    .join(" ");
+  svg.innerHTML = [
+    `<line class="strategy-baseline" x1="${pad}" x2="${width - pad}" y1="${y(100)}" y2="${y(100)}"></line>`,
+    `<path class="strategy-hold-line" d="${path(holdValues)}"></path>`,
+    `<path class="strategy-model-line" d="${path(strategyValues)}"></path>`,
+  ].join("");
+}
+
+function renderStrataTable(id, strata, showReturn) {
+  $(id).replaceChildren(...strata.map((item) => {
+    const row = document.createElement("tr");
+    const values = [
+      item.label,
+      item.count,
+      `${item.accuracy}%`,
+      showReturn ? pct(item.average_return) : Number(item.brier).toFixed(3),
+    ];
+    row.append(...values.map((value, index) => {
+      const cell = document.createElement(index === 0 ? "th" : "td");
+      cell.textContent = value;
+      return cell;
+    }));
+    return row;
+  }));
+}
+
+function renderEvaluationRecords(records) {
+  const latest = records.slice(-14).reverse();
+  $("evaluationBody").replaceChildren(...latest.map((record) => {
+    const row = document.createElement("tr");
+    const result = record.signal === "neutral"
+      ? "No call"
+      : record.signal_correct ? "Correct" : "Wrong";
+    const values = [
+      formatDate(record.date),
+      `${record.probability_up}%`,
+      `${record.edge_points >= 0 ? "+" : ""}${record.edge_points} pts`,
+      record.signal,
+      pct(record.actual_return),
+      result,
+    ];
+    row.append(...values.map((value, index) => {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      if (index === 5) {
+        cell.className = result === "Correct" ? "result-correct"
+          : result === "Wrong" ? "result-wrong" : "";
+      }
+      return cell;
+    }));
+    return row;
+  }));
+}
+
+function formatDate(value) {
+  const date = new Date(`${value}T12:00:00`);
+  return Number.isNaN(date.valueOf())
+    ? String(value || "—")
+    : date.toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+}
+
 function renderCatalyst(catalyst) {
   const warning = $("catalystWarning");
   warning.hidden = !catalyst?.near;
@@ -331,6 +515,7 @@ function renderUnavailable(play) {
   $("rangeMedianMarker").style.left = "50%";
   $("evidenceFacts").replaceChildren();
   renderReliability({ available: false, reason: play.reason });
+  renderAudit({ available: false, reason: play.reason });
   $("receiptsBody").replaceChildren();
   $("toggleReceipts").hidden = true;
   $("planRows").replaceChildren();
@@ -339,6 +524,156 @@ function renderUnavailable(play) {
   $("planSizer").hidden = true;
   $("catalystWarning").hidden = true;
   $("chartTooltip").hidden = true;
+}
+
+function setTimeMachineBounds(data) {
+  if (!data.history.length) return;
+  const input = $("timeMachineDate");
+  const latest = data.history[data.history.length - 1].date;
+  input.max = latest;
+  if (!input.value || input.value >= latest) {
+    const defaultIndex = Math.max(0, data.history.length - 126);
+    input.value = data.history[defaultIndex].date;
+  }
+}
+
+async function loadTrackRecord(symbol) {
+  if (state.trackRequest) state.trackRequest.abort();
+  const controller = new AbortController();
+  state.trackRequest = controller;
+  try {
+    const response = await fetch(
+      `/api/track-record/${encodeURIComponent(symbol)}`,
+      { signal: controller.signal, headers: { Accept: "application/json" } },
+    );
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Track record unavailable.");
+    if (state.trackRequest !== controller || state.analysis?.symbol !== symbol) return;
+    renderTrackRecord(data);
+  } catch (error) {
+    if (error.name !== "AbortError" && state.trackRequest === controller) {
+      $("trackRecordEmpty").hidden = false;
+      $("trackRecordEmpty").textContent = error.message;
+    }
+  } finally {
+    if (state.trackRequest === controller) state.trackRequest = null;
+  }
+}
+
+function renderTrackRecord(data) {
+  const records = data.records || [];
+  $("trackRecordEmpty").hidden = records.length > 0;
+  if (!records.length) {
+    $("trackSummary").replaceChildren();
+    $("trackRecordList").replaceChildren();
+    return;
+  }
+  const summary = data.summary;
+  const facts = [
+    ["Stored", summary.total],
+    ["Graded", summary.graded],
+    ["Pending", summary.pending],
+    ["Directional accuracy", summary.directional_accuracy === null
+      ? "—" : `${summary.directional_accuracy}%`],
+  ];
+  $("trackSummary").replaceChildren(...facts.map(([label, value]) => {
+    const item = document.createElement("div");
+    const key = document.createElement("span");
+    const result = document.createElement("strong");
+    key.textContent = label;
+    result.textContent = value;
+    item.append(key, result);
+    return item;
+  }));
+  $("trackRecordList").replaceChildren(...records.slice(0, 8).map((record) => {
+    const row = document.createElement("article");
+    row.className = "track-record-row";
+    const call = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = `${formatDate(record.as_of_date)} · ${record.direction}`;
+    const detail = document.createElement("span");
+    detail.textContent =
+      `${record.probability_up}% up · ${record.edge_points >= 0 ? "+" : ""}${record.edge_points} pt edge`;
+    call.append(title, detail);
+    const outcome = document.createElement("div");
+    outcome.className = "track-outcome";
+    if (record.status === "graded") {
+      outcome.textContent = pct(record.realized_return);
+      outcome.dataset.result = record.direction_correct === true
+        ? "correct" : record.direction_correct === false ? "wrong" : "neutral";
+    } else {
+      outcome.textContent = `Due ${formatDate(record.horizon_date)}`;
+      outcome.dataset.result = "pending";
+    }
+    row.append(call, outcome);
+    return row;
+  }));
+}
+
+async function runTimeMachine(date) {
+  const symbol = state.analysis?.symbol;
+  if (!symbol) return;
+  if (state.timeRequest) state.timeRequest.abort();
+  const controller = new AbortController();
+  state.timeRequest = controller;
+  $("timeMachineStatus").textContent = "Rebuilding the fingerprint with later rows sealed off…";
+  $("timeMachineResult").hidden = true;
+  try {
+    const url =
+      `/api/analyze/${encodeURIComponent(symbol)}/as-of?date=${encodeURIComponent(date)}`;
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Time Machine could not run.");
+    if (state.timeRequest !== controller) return;
+    renderTimeMachine(data);
+    $("timeMachineStatus").textContent =
+      `Forecast rebuilt at ${formatDate(data.time_machine.session_date)} with no future rows.`;
+  } catch (error) {
+    if (error.name !== "AbortError" && state.timeRequest === controller) {
+      $("timeMachineStatus").textContent = error.message;
+    }
+  } finally {
+    if (state.timeRequest === controller) state.timeRequest = null;
+  }
+}
+
+function renderTimeMachine(data) {
+  const box = $("timeMachineResult");
+  const play = data.playbook;
+  if (!play.available) {
+    box.textContent = play.reason;
+    box.hidden = false;
+    return;
+  }
+  const outcome = data.time_machine.outcome;
+  const forecast = document.createElement("div");
+  forecast.className = "time-machine-call";
+  const probability = document.createElement("strong");
+  probability.textContent = `${play.forecast.probability_up}%`;
+  const copy = document.createElement("span");
+  copy.textContent =
+    `${play.verdict.headline} · ${play.forecast.edge_points >= 0 ? "+" : ""}` +
+    `${play.forecast.edge_points} point analog edge`;
+  forecast.append(probability, copy);
+  const realized = document.createElement("div");
+  realized.className = "time-machine-outcome";
+  if (outcome.available) {
+    realized.dataset.result = outcome.direction_correct === true
+      ? "correct" : outcome.direction_correct === false ? "wrong" : "neutral";
+    realized.textContent =
+      `What happened by ${formatDate(outcome.date)}: ${pct(outcome.realized_return)} · ` +
+      `${outcome.direction_correct === true ? "direction correct"
+        : outcome.direction_correct === false ? "direction wrong" : "no directional call"}`;
+  } else {
+    realized.textContent = outcome.reason;
+  }
+  const seal = document.createElement("small");
+  seal.textContent = "Forecast input cutoff verified · historical news excluded";
+  box.replaceChildren(forecast, realized, seal);
+  box.hidden = false;
 }
 
 function renderStory(story) {
@@ -700,6 +1035,10 @@ $("toggleReceipts").addEventListener("click", () => {
 });
 
 $("investAmount").addEventListener("input", updateSizer);
+$("timeMachineForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  runTimeMachine($("timeMachineDate").value);
+});
 $("themeToggle").addEventListener("click", () => {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;

@@ -101,6 +101,44 @@ class PlaybookTests(unittest.TestCase):
         )
         self.assertEqual(validation["selection"]["profiles_tested"], 4)
 
+    def test_dense_audit_exposes_calibration_strata_and_strategy(self):
+        validation = self.result["validation"]
+        records = validation["records"]
+
+        self.assertGreater(len(records), 40)
+        self.assertEqual(
+            sum(bucket["count"] for bucket in validation["calibration"]),
+            validation["sample_size"],
+        )
+        self.assertEqual(
+            sum(bucket["count"] for bucket in validation["edge_strata"]),
+            validation["sample_size"],
+        )
+        self.assertEqual(
+            sum(bucket["count"] for bucket in validation["regime_strata"]),
+            validation["sample_size"],
+        )
+        self.assertIn("brier_skill", validation)
+        self.assertTrue(validation["strategy"]["available"])
+        self.assertLessEqual(len(validation["strategy"]["curve"]), 120)
+        self.assertIsNotNone(validation["strategy"]["curve"][0]["date"])
+        self.assertIn("continuous buy-and-hold", validation["strategy"]["note"])
+        self.assertLessEqual(
+            validation["independent_sample_size"],
+            validation["sample_size"],
+        )
+
+        positions = [
+            self.history.index.get_loc(pd.Timestamp(record["date"], tz="UTC"))
+            for record in records[:10]
+        ]
+        self.assertTrue(
+            all(
+                current - previous == 5
+                for previous, current in zip(positions, positions[1:])
+            )
+        )
+
     def test_short_history_is_unavailable(self):
         result = build_playbook(make_history(periods=120))
 
