@@ -77,23 +77,39 @@ python app.py
 
 Open [http://localhost:8000](http://localhost:8000). Yahoo Finance supplies market data; no API key is required.
 
+For a Windows production process, use Waitress:
+
+```powershell
+python serve.py
+```
+
+Set `PORT`, `HOST`, and `WAITRESS_THREADS` to override its defaults.
+
+### Persistent adjusted-price cache
+
+Playbook stores adjusted OHLCV in `instance/playbook.sqlite3` and refreshes only the latest overlap on normal requests. It performs a full refresh weekly, when `?refresh=1` is used, or when the overlap reveals a split/adjustment drift above 0.5%. Set `PLAYBOOK_DATA_CACHE` to place the SQLite database elsewhere.
+
+Quick forecasts also persist a short-lived, opaque source-snapshot token. The audit endpoint uses that token to reload the exact same prices, profile, headlines, warnings, and market context—even when a different Gunicorn or Waitress worker handles the request. Expired and excess snapshots are removed automatically.
+
 ## Test
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-The 30-test suite covers the richer fingerprint, corrected RSI edge case, independent episode spacing, bounded news adjustment, post-entry intraday path outcomes, extreme base rates, global session-date alignment, crypto calendar windows, base-rate shrinkage, walk-forward reporting, service caching, API errors, and sentiment behavior.
+The 56-test suite covers vectorized shape equivalence, batch/single matching equivalence, persistent cache refresh and split drift, cross-worker snapshot coherence and bounds, progressive endpoints, the richer fingerprint, corrected RSI edge cases, independent episode spacing, bounded news adjustment, post-entry intraday path outcomes, extreme base rates, global session-date alignment, crypto calendar windows, base-rate shrinkage, walk-forward reporting, API errors, and sentiment behavior. A deterministic 20-year pure-compute benchmark runs in roughly 0.8 seconds on the development machine.
 
 ## API
 
 ```text
 GET /api/health
 GET /api/analyze/NVDA
+GET /api/analyze/NVDA/quick
+GET /api/analyze/NVDA/audit?snapshot=<quick-response-token>
 GET /api/analyze/BTC-USD?refresh=1
 ```
 
-Responses are cached in memory for five minutes. `?refresh=1` bypasses the cache.
+The original endpoint remains backward compatible. The browser requests `/quick` first so the fingerprint, twins, projection, and preliminary forecast paint immediately, then passes its snapshot token to `/audit` for adaptive weight selection and untouched walk-forward evaluation on the exact same source data. A real progress bar reflects those stages. Responses remain cached in memory for five minutes. Use `?refresh=1` on the original or quick endpoint to create a fresh price snapshot; snapshot-bound audit requests intentionally reject refresh.
 
 ## Docker
 

@@ -48,30 +48,18 @@ function saveWatchlist() {
   storageSet("playbook-watchlist", JSON.stringify(state.watchlist));
 }
 
-const LOADING_LINES = [
-  "Building today’s market fingerprint…",
-  "Comparing the 21-day chart shape…",
-  "Searching twenty years for independent twins…",
-  "Replaying every matched future…",
-  "Running untouched walk-forward checks…",
-  "Applying today’s bounded news adjustment…",
-];
-let loadingTimer = null;
-
 function startLoading() {
-  let index = 0;
-  clearInterval(loadingTimer);
   $("loadingStrip").hidden = false;
-  $("loadingText").textContent = LOADING_LINES[0];
-  loadingTimer = setInterval(() => {
-    index = (index + 1) % LOADING_LINES.length;
-    $("loadingText").textContent = LOADING_LINES[index];
-  }, 1500);
+  setLoadingStage("Fetching adjusted prices and current headlines…", 8);
+}
+
+function setLoadingStage(message, progress) {
+  $("loadingText").textContent = message;
+  $("loadingBar").style.width = `${Math.max(0, Math.min(100, progress))}%`;
 }
 
 function stopLoading() {
-  clearInterval(loadingTimer);
-  loadingTimer = null;
+  setLoadingStage("Forecast and audit ready.", 100);
   $("loadingStrip").hidden = true;
 }
 
@@ -91,28 +79,53 @@ async function loadSymbol(rawSymbol) {
   $("statusMessage").textContent = "";
   $("symbolInput").value = symbol;
   startLoading();
+  let quickRendered = false;
 
   try {
-    const response = await fetch(`/api/analyze/${encodeURIComponent(symbol)}`, {
+    const quickResponse = await fetch(`/api/analyze/${encodeURIComponent(symbol)}/quick`, {
       signal: controller.signal,
       headers: { Accept: "application/json" },
     });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Playbook could not build this forecast.");
+    const quick = await quickResponse.json();
+    if (!quickResponse.ok) {
+      throw new Error(quick.error || "Playbook could not build this forecast.");
     }
     if (state.request !== controller) return;
 
-    state.analysis = payload;
+    state.analysis = quick;
+    quickRendered = true;
     state.showAllReceipts = false;
-    render(payload);
+    setLoadingStage("Historical twins found. Painting the preliminary forecast…", 58);
+    render(quick);
     const url = new URL(window.location.href);
-    url.searchParams.set("symbol", payload.symbol);
+    url.searchParams.set("symbol", quick.symbol);
     window.history.replaceState({}, "", url);
-    storageSet("playbook-last-symbol", payload.symbol);
+    storageSet("playbook-last-symbol", quick.symbol);
+
+    setLoadingStage("Running untouched walk-forward audit checkpoints…", 72);
+    const auditUrl = `/api/analyze/${encodeURIComponent(symbol)}/audit?snapshot=${encodeURIComponent(quick.snapshot_id)}`;
+    const auditResponse = await fetch(auditUrl, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    const audited = await auditResponse.json();
+    if (!auditResponse.ok) {
+      throw new Error(audited.error || "The forecast loaded, but its audit did not.");
+    }
+    if (state.request !== controller) return;
+    if (audited.snapshot_id !== quick.snapshot_id) {
+      throw new Error(
+        "Market data changed while the audit was running; search again for one coherent snapshot.",
+      );
+    }
+    state.analysis = audited;
+    setLoadingStage("Calibrating evidence and finalizing the forecast…", 94);
+    render(audited);
   } catch (error) {
     if (error.name !== "AbortError" && state.request === controller) {
-      $("statusMessage").textContent = error.message;
+      $("statusMessage").textContent = quickRendered
+        ? `Preliminary forecast shown. Audit unavailable: ${error.message}`
+        : error.message;
     }
   } finally {
     if (state.request === controller) {
@@ -166,7 +179,8 @@ function renderForecast(play) {
     verdict.direction === "bullish" ? "↗" : verdict.direction === "bearish" ? "↘" : "⇄";
   $("verdictHeadline").textContent = verdict.headline;
   $("verdictExplanation").textContent = verdict.explanation;
-  $("horizonKicker").textContent = `${forecast.horizon_label} analog forecast`;
+  $("horizonKicker").textContent =
+    `${play.preliminary ? "Preliminary · " : ""}${forecast.horizon_label} analog forecast`;
   $("setupLine").textContent = play.setup;
   $("setupLine").hidden = false;
 
@@ -257,7 +271,9 @@ function renderRange(play) {
 
 function renderReliability(validation) {
   if (!validation.available) {
-    $("reliabilityGrade").textContent = "Not enough checks";
+    $("reliabilityGrade").textContent = validation.pending
+      ? "Audit loading"
+      : "Not enough checks";
     $("reliabilityGrade").dataset.grade = "limited";
     $("validationAccuracy").textContent = "—";
     $("validationAccuracyLabel").textContent = "Reliability is not established yet";

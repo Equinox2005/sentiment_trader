@@ -6,6 +6,7 @@ matching pipeline before presenting a forecast.
 """
 
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import numpy as np
@@ -92,12 +93,25 @@ WEIGHT_PROFILES = {
 }
 
 
+@dataclass(frozen=True)
+class PreparedMatrices:
+    feature_names: tuple
+    feature_columns: dict
+    feature_values: np.ndarray
+    shapes: np.ndarray
+    close: np.ndarray
+    high: np.ndarray
+    low: np.ndarray
+    dates: np.ndarray
+
+
 def build_playbook(
     history,
     context=None,
     news_score=0.0,
     news_count=0,
     earnings_at=None,
+    include_validation=True,
 ):
     """Build a historical analog forecast from OHLCV market history."""
     frame = _normalize_history(history)
@@ -113,6 +127,7 @@ def build_playbook(
 
     features = _compute_features(frame, context, config)
     shapes = _compute_shapes(frame["Close"], config["shape_days"])
+    prepared = _prepare_matrices(frame, features, shapes)
     today_position = len(frame) - 1
     current_features = features.iloc[today_position]
     if current_features.dropna().shape[0] < 8:
@@ -121,9 +136,17 @@ def build_playbook(
             "reason": "Today's setup could not be measured reliably from the available data.",
         }
 
-    profile_key, profile_selection = _select_weight_profile(
-        frame, features, shapes, config
-    )
+    if include_validation:
+        profile_key, profile_selection = _select_weight_profile(
+            frame, features, shapes, config, prepared
+        )
+    else:
+        profile_key = "balanced"
+        profile_selection = {
+            "tuning_forecasts": 0,
+            "profiles_tested": 0,
+            "reason": "Preliminary forecast; adaptive audit is loading.",
+        }
     matches = _rank_matches(
         frame,
         features,
@@ -132,6 +155,7 @@ def build_playbook(
         profile_key,
         include_paths=True,
         config=config,
+        prepared=prepared,
     )
     if len(matches) < MIN_MATCHES:
         return {
@@ -142,13 +166,23 @@ def build_playbook(
             ),
         }
 
-    validation = _walk_forward_validation(
-        frame,
-        features,
-        shapes,
-        profile_key,
-        profile_selection,
-        config,
+    validation = (
+        _walk_forward_validation(
+            frame,
+            features,
+            shapes,
+            profile_key,
+            profile_selection,
+            config,
+            prepared,
+        )
+        if include_validation
+        else {
+            "available": False,
+            "pending": True,
+            "reason": "Walk-forward audit is loading.",
+            "selection": profile_selection,
+        }
     )
     summary = _summarize_matches(matches)
     forecast = _build_forecast(
@@ -167,6 +201,7 @@ def build_playbook(
 
     return {
         "available": True,
+        "preliminary": not include_validation,
         "setup": _describe_setup(current_features, regime),
         "fingerprint": _build_fingerprint(current_features, regime, features),
         "matching": {
@@ -184,8 +219,12 @@ def build_playbook(
                 0.5,
             )),
             "explanation": (
-                "Weights were selected on older walk-forward forecasts. "
-                "The latest validation period was kept untouched."
+                (
+                    "Weights were selected on older walk-forward forecasts. "
+                    "The latest validation period was kept untouched."
+                )
+                if include_validation
+                else "Balanced preliminary weights are shown while the adaptive audit loads."
             ),
         },
         "forecast": forecast,
@@ -418,17 +457,56 @@ def _align_context(context, target_index):
 def _compute_shapes(close, shape_days=SHAPE_DAYS):
     values = close.to_numpy(dtype=float)
     shapes = np.full((len(values), shape_days + 1), np.nan, dtype=float)
-    for end in range(shape_days, len(values)):
-        path = np.log(values[end - shape_days : end + 1] / values[end - shape_days])
-        spread = float(np.std(path))
-        if not np.isfinite(spread) or spread < 1e-9:
-            shapes[end] = np.zeros(shape_days + 1)
-        else:
-            shapes[end] = (path - float(np.mean(path))) / spread
+    if len(values) <= shape_days:
+        return shapes
+    windows = np.lib.stride_tricks.sliding_window_view(
+        values, shape_days + 1
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        paths = np.log(windows / windows[:, :1])
+    means = np.nanmean(paths, axis=1, keepdims=True)
+    spreads = np.nanstd(paths, axis=1, keepdims=True)
+    valid = (
+        np.isfinite(paths).all(axis=1)
+        & np.isfinite(spreads[:, 0])
+        & (spreads[:, 0] >= 1e-9)
+    )
+    normalized = np.zeros_like(paths, dtype=np.float64)
+    np.divide(
+        paths - means,
+        spreads,
+        out=normalized,
+        where=valid[:, None],
+    )
+    normalized[~np.isfinite(paths).all(axis=1)] = np.nan
+    shapes[shape_days:] = normalized
     return shapes
 
 
-def _select_weight_profile(frame, features, shapes, config):
+def _prepare_matrices(frame, features, shapes):
+    names = tuple(features.columns)
+    return PreparedMatrices(
+        feature_names=names,
+        feature_columns={name: index for index, name in enumerate(names)},
+        feature_values=np.ascontiguousarray(
+            features.to_numpy(dtype=np.float64), dtype=np.float64
+        ),
+        shapes=np.ascontiguousarray(shapes, dtype=np.float64),
+        close=np.ascontiguousarray(
+            frame["Close"].to_numpy(dtype=np.float64)
+        ),
+        high=np.ascontiguousarray(
+            frame["High"].to_numpy(dtype=np.float64)
+        ),
+        low=np.ascontiguousarray(
+            frame["Low"].to_numpy(dtype=np.float64)
+        ),
+        dates=np.asarray(frame.index, dtype=object),
+    )
+
+
+def _select_weight_profile(frame, features, shapes, config, prepared=None):
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
     anchors = _validation_anchors(len(frame), config)
     if len(anchors) < 10:
         return "balanced", {
@@ -442,7 +520,7 @@ def _select_weight_profile(frame, features, shapes, config):
     scores = {}
     for profile_key in WEIGHT_PROFILES:
         predictions = _historical_predictions(
-            frame, features, shapes, profile_key, tuning, config
+            frame, features, shapes, profile_key, tuning, config, prepared
         )
         scores[profile_key] = _brier_score(predictions)
 
@@ -463,13 +541,14 @@ def _select_weight_profile(frame, features, shapes, config):
 
 
 def _walk_forward_validation(
-    frame, features, shapes, profile_key, selection, config
+    frame, features, shapes, profile_key, selection, config, prepared=None
 ):
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
     anchors = _validation_anchors(len(frame), config)
     split = max(5, len(anchors) // 2)
     evaluation = anchors[split:] if len(anchors) >= 10 else []
     predictions = _historical_predictions(
-        frame, features, shapes, profile_key, evaluation, config
+        frame, features, shapes, profile_key, evaluation, config, prepared
     )
     if len(predictions) < 5:
         return {
@@ -556,20 +635,23 @@ def _validation_anchors(length, config):
 
 
 def _historical_predictions(
-    frame, features, shapes, profile_key, anchors, config
+    frame, features, shapes, profile_key, anchors, config, prepared=None
 ):
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
     predictions = []
     close = frame["Close"]
+    match_sets = _rank_matches_batch(
+        frame,
+        features,
+        shapes,
+        anchors,
+        profile_key,
+        include_paths=False,
+        config=config,
+        prepared=prepared,
+    )
     for target_position in anchors:
-        matches = _rank_matches(
-            frame,
-            features,
-            shapes,
-            target_position,
-            profile_key,
-            include_paths=False,
-            config=config,
-        )
+        matches = match_sets.get(target_position, [])
         if len(matches) < MIN_MATCHES:
             continue
         summary = _summarize_matches(matches)
@@ -592,6 +674,32 @@ def _historical_predictions(
     return predictions
 
 
+def _rank_matches_batch(
+    frame,
+    features,
+    shapes,
+    target_positions,
+    profile_key,
+    include_paths,
+    config,
+    prepared=None,
+):
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
+    return {
+        target_position: _rank_matches(
+            frame,
+            features,
+            shapes,
+            target_position,
+            profile_key,
+            include_paths=include_paths,
+            config=config,
+            prepared=prepared,
+        )
+        for target_position in target_positions
+    }
+
+
 def _rank_matches(
     frame,
     features,
@@ -600,29 +708,38 @@ def _rank_matches(
     profile_key,
     include_paths,
     config=None,
+    prepared=None,
 ):
     config = config or _sampling_config(frame)
+    prepared = prepared or _prepare_matrices(frame, features, shapes)
     candidate_end = target_position - config["recent_exclusion"]
     if candidate_end <= config["warmup"]:
         return []
     positions = np.arange(config["warmup"], candidate_end + 1, dtype=int)
     profile = WEIGHT_PROFILES[profile_key]
-    target = features.iloc[target_position]
+    target_values_all = prepared.feature_values[target_position]
 
     usable = []
+    usable_indices = []
     feature_weights = []
     for name, weight in profile["weights"].items():
-        if name not in features or not np.isfinite(target.get(name, float("nan"))):
+        column = prepared.feature_columns.get(name)
+        if column is None or not np.isfinite(target_values_all[column]):
             continue
-        coverage = features.iloc[positions][name].notna().mean()
+        coverage = np.isfinite(
+            prepared.feature_values[positions, column]
+        ).mean()
         if coverage >= 0.75:
             usable.append(name)
+            usable_indices.append(column)
             feature_weights.append(weight)
     if len(usable) < 6:
         return []
 
-    candidate_values = features.iloc[positions][usable].to_numpy(dtype=float)
-    target_values = target[usable].to_numpy(dtype=float)
+    candidate_values = prepared.feature_values[
+        np.ix_(positions, np.asarray(usable_indices, dtype=int))
+    ]
+    target_values = target_values_all[usable_indices]
     medians = np.nanmedian(candidate_values, axis=0)
     deviations = np.nanmedian(np.abs(candidate_values - medians), axis=0) * 1.4826
     standard = np.nanstd(candidate_values, axis=0)
@@ -647,10 +764,10 @@ def _rank_matches(
     distance_numerator = differences @ weights
     minimum_coverage = float(weights.sum()) * 0.75
 
-    target_shape = shapes[target_position]
+    target_shape = prepared.shapes[target_position]
     shape_weight = profile["shape"]
     if np.isfinite(target_shape).all():
-        candidate_shapes = shapes[positions]
+        candidate_shapes = prepared.shapes[positions]
         shape_valid = np.isfinite(candidate_shapes).all(axis=1)
         shape_distance = np.sqrt(
             np.nanmean((candidate_shapes - target_shape) ** 2, axis=1)
@@ -675,9 +792,13 @@ def _rank_matches(
     for position, distance in ranked:
         if any(abs(position - used) < config["spacing"] for used in used_positions):
             continue
-        selected.append(_match_record(
-            frame, features, position, distance, include_paths, config
-        ))
+        selected.append(
+            _match_record(
+                frame, features, position, distance, True, config
+            )
+            if include_paths
+            else _match_record_fast(prepared, position, distance, config)
+        )
         used_positions.append(position)
         if len(selected) == MAX_MATCHES:
             break
@@ -743,6 +864,33 @@ def _match_record(
         "high_path": high_path.tolist() if include_path else [],
         "low_path": low_path.tolist() if include_path else [],
         "regime": regime,
+    }
+
+
+def _match_record_fast(prepared, position, distance, config):
+    horizon = config["horizon_days"]
+    entry = prepared.close[position]
+    future = prepared.close[position : position + horizon + 1]
+    path = (future / entry - 1) * 100
+    high_path = (
+        prepared.high[position + 1 : position + horizon + 1] / entry - 1
+    ) * 100
+    low_path = (
+        prepared.low[position + 1 : position + horizon + 1] / entry - 1
+    ) * 100
+    return {
+        "position": position,
+        "date": prepared.dates[position],
+        "distance": distance,
+        "fwd_5d": float(path[5]),
+        "fwd_10d": float(path[10]),
+        "fwd_21d": float(path[horizon]),
+        "max_upside": float(np.max(high_path)),
+        "max_drawdown": float(np.min(low_path)),
+        "path": [],
+        "high_path": [],
+        "low_path": [],
+        "regime": {},
     }
 
 

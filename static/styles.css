@@ -203,15 +203,20 @@ h1 em { color: var(--accent); font-style: normal; }
 
 .loading-strip { margin: 10px 0 24px; }
 
-.loading-bar {
+.loading-track {
   height: 4px;
+  overflow: hidden;
   border-radius: 4px;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  background-size: 200% 100%;
-  animation: slide 1.2s linear infinite;
+  background: var(--surface-2);
 }
 
-@keyframes slide { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.loading-bar {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 350ms ease;
+}
 
 .loading-strip p { margin: 10px 0 0; color: var(--muted); font-size: 13px; }
 

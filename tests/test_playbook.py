@@ -12,6 +12,9 @@ from playbook import (
     _first_touch,
     _match_record,
     _normalize_history,
+    _prepare_matrices,
+    _rank_matches,
+    _rank_matches_batch,
     _sampling_config,
     build_playbook,
 )
@@ -238,6 +241,71 @@ class PlaybookTests(unittest.TestCase):
         self.assertEqual(result["matching"]["shape_window_days"], 30)
         self.assertEqual(result["matching"]["independence_days"], 60)
         self.assertEqual(len(result["projection"]["days"]), 31)
+
+    def test_vectorized_shapes_match_reference_loop(self):
+        from playbook import _compute_shapes
+
+        close = self.history["Close"].iloc[:180]
+        for window in (21, 30):
+            actual = _compute_shapes(close, window)
+            expected = pd.DataFrame(
+                float("nan"),
+                index=range(len(close)),
+                columns=range(window + 1),
+            ).to_numpy()
+            values = close.to_numpy(dtype=float)
+            for end in range(window, len(values)):
+                path = pd.Series(
+                    [
+                        math.log(value / values[end - window])
+                        for value in values[end - window : end + 1]
+                    ]
+                )
+                spread = path.std(ddof=0)
+                expected[end] = (
+                    ((path - path.mean()) / spread).to_numpy()
+                    if spread >= 1e-9
+                    else 0.0
+                )
+            self.assertTrue(
+                pd.DataFrame(actual).fillna(0).round(12).equals(
+                    pd.DataFrame(expected).fillna(0).round(12)
+                )
+            )
+
+    def test_batch_ranker_matches_single_anchor_results(self):
+        from playbook import _compute_shapes
+
+        frame = _normalize_history(self.history)
+        config = _sampling_config(frame)
+        features = _compute_features(frame, self.context, config)
+        shapes = _compute_shapes(frame["Close"], config["shape_days"])
+        prepared = _prepare_matrices(frame, features, shapes)
+        anchors = [1200, 1450]
+        batch = _rank_matches_batch(
+            frame,
+            features,
+            shapes,
+            anchors,
+            "balanced",
+            include_paths=False,
+            config=config,
+            prepared=prepared,
+        )
+        for anchor in anchors:
+            single = _rank_matches(
+                frame,
+                features,
+                shapes,
+                anchor,
+                "balanced",
+                include_paths=False,
+                config=config,
+            )
+            self.assertEqual(
+                [(item["position"], item["quality"]) for item in batch[anchor]],
+                [(item["position"], item["quality"]) for item in single],
+            )
 
     def test_trade_plan_uses_real_path_extremes_or_abstains(self):
         plan = self.result["trade_plan"]
