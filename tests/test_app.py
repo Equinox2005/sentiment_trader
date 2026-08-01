@@ -5,9 +5,17 @@ from market_data import InvalidSymbolError
 
 
 class StubService:
-    def analyze(self, symbol, force_refresh=False):
+    def analyze(self, symbol, force_refresh=False, include_validation=True):
         if symbol == "BAD":
             raise InvalidSymbolError("That symbol is invalid.")
+        if include_validation and symbol == "SIG":
+            return {
+                "symbol": "SIG",
+                "name": "Signal Co",
+                "quote": {"price": 100.0},
+                "history": [{"date": "2025-06-10", "close": 100.0}],
+                "playbook": {"available": False, "reason": "Not enough history."},
+            }
         return {
             "symbol": symbol.upper(),
             "refreshed": force_refresh,
@@ -39,11 +47,17 @@ class StubService:
 
 
 class StubBoard:
-    def latest(self, limit=25):
+    def latest(self, limit=50, side=None):
+        longs = [{"symbol": "AAA", "side": "long"}][:limit]
+        shorts = [{"symbol": "ZZZ", "side": "short"}][:limit]
         return {
             "available": True,
             "run": {"session_date": "2025-06-10"},
-            "opportunities": [{"symbol": "AAA"}][:limit],
+            "long_count": len(longs),
+            "short_count": len(shorts),
+            "longs": longs if side in (None, "long") else [],
+            "shorts": shorts if side in (None, "short") else [],
+            "opportunities": longs,
         }
 
     def history(self):
@@ -53,7 +67,8 @@ class StubBoard:
 class AppTests(unittest.TestCase):
     def setUp(self):
         app = create_app(StubService(), board_service=StubBoard())
-        app.config.update(TESTING=True)
+        # Pinned so a developer's exported token cannot change the expectations.
+        app.config.update(TESTING=True, SCAN_TOKEN="")
         self.client = app.test_client()
 
     def test_health_endpoint(self):
@@ -111,30 +126,71 @@ class AppTests(unittest.TestCase):
         self.assertEqual(track.status_code, 200)
         self.assertEqual(track.get_json()["symbol"], "AAPL")
 
-    def test_homepage_renders_product(self):
+    def test_homepage_is_the_signal_board_with_an_inline_checker(self):
         response = self.client.get("/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Playbook", response.data)
-        self.assertIn(b"receipts", response.data)
+        self.assertIn(b"Buy signals", response.data)
+        self.assertIn(b"Short signals", response.data)
+        self.assertIn(b"Check any ticker", response.data)
 
-    def test_opportunity_board_page_and_read_only_apis(self):
+    def test_board_apis_expose_both_sides(self):
         page = self.client.get("/opportunities")
         latest = self.client.get("/api/opportunities/latest?limit=10")
         history = self.client.get("/api/opportunities/history")
 
         self.assertEqual(page.status_code, 200)
-        self.assertIn(b"largest", page.data)
         self.assertEqual(latest.status_code, 200)
-        self.assertEqual(latest.get_json()["opportunities"][0]["symbol"], "AAA")
+        self.assertEqual(latest.get_json()["longs"][0]["symbol"], "AAA")
+        self.assertEqual(latest.get_json()["shorts"][0]["symbol"], "ZZZ")
         self.assertEqual(latest.headers["Cache-Control"], "no-store")
         self.assertEqual(history.get_json()["runs"][0]["status"], "completed")
 
-    def test_opportunity_limit_is_validated(self):
-        response = self.client.get("/api/opportunities/latest?limit=nope")
+    def test_board_side_filter_and_limit_are_validated(self):
+        bad_limit = self.client.get("/api/opportunities/latest?limit=nope")
+        bad_side = self.client.get("/api/opportunities/latest?side=sideways")
+        shorts_only = self.client.get("/api/opportunities/latest?side=short")
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["code"], "invalid_limit")
+        self.assertEqual(bad_limit.status_code, 400)
+        self.assertEqual(bad_limit.get_json()["code"], "invalid_limit")
+        self.assertEqual(bad_side.status_code, 400)
+        self.assertEqual(bad_side.get_json()["code"], "invalid_side")
+        self.assertEqual(shorts_only.get_json()["longs"], [])
+
+    def test_signal_endpoint_scores_one_symbol(self):
+        response = self.client.get("/api/signal/SIG")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["symbol"], "SIG")
+        self.assertFalse(payload["playbook_available"])
+        self.assertFalse(payload["eligible"])
+        self.assertEqual(payload["spark"], [100.0])
+
+    def test_remote_scan_trigger_is_disabled_without_a_token(self):
+        response = self.client.post("/api/opportunities/run")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["code"], "trigger_disabled")
+
+    def test_remote_scan_trigger_rejects_a_wrong_token(self):
+        app = create_app(StubService(), board_service=StubBoard())
+        app.config.update(TESTING=True, SCAN_TOKEN="secret")
+        client = app.test_client()
+
+        response = client.post(
+            "/api/opportunities/run",
+            headers={"X-Playbook-Scan-Token": "guess"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["code"], "forbidden")
+
+    def test_scan_status_endpoint_reports_idle_state(self):
+        response = self.client.get("/api/opportunities/status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()["scan_running"])
 
     def test_shareable_forecast_and_audit_pages_embed_route_state(self):
         forecast = self.client.get("/forecast/nvda")

@@ -1,0 +1,31 @@
+# Free alternative to a paid Render cron job.
+#
+# Add two repository secrets:
+#   PLAYBOOK_SCAN_URL   — e.g. https://playbook.onrender.com
+#   PLAYBOOK_SCAN_TOKEN — the value of PLAYBOOK_SCAN_TOKEN on the web service
+#
+# GitHub's scheduler can lag by several minutes; the scanner refuses to run
+# before the close is confirmed, so a late trigger is harmless.
+
+name: Nightly market scan
+
+on:
+  schedule:
+    - cron: "30 22 * * 1-5"   # 22:30 UTC on weekdays
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Wake the service and start the scan
+        env:
+          PLAYBOOK_SCAN_URL: ${{ secrets.PLAYBOOK_SCAN_URL }}
+          PLAYBOOK_SCAN_TOKEN: ${{ secrets.PLAYBOOK_SCAN_TOKEN }}
+        run: |
+          curl -sS --max-time 120 --retry 3 "$PLAYBOOK_SCAN_URL/api/health" || true
+          python trigger_scan.py

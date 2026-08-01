@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Every US-listed stock scanned nightly against 20 years of history. Clear buy and short signals, ranked, with the evidence behind each one.">
+  <title>Playbook — Today’s buy and short signals</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='board.css') }}">
+  <script defer src="{{ url_for('static', filename='board.js') }}"></script>
+</head>
+<body class="board-page">
+  <header class="site-header">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">⟲</span>
+      <span>Playbook</span>
+    </a>
+    <div class="header-actions">
+      <span class="scan-chip" id="scanChip">Loading scan…</span>
+      <button class="icon-button" id="themeToggle" type="button" aria-label="Switch color theme">◐</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="board-hero">
+      <h1>Today’s clearest <em class="up-text">buy</em> and <em class="down-text">short</em> signals.</h1>
+      <p class="board-lede">
+        Every listed stock is re-scanned after each close. Playbook matches today’s setup
+        against twenty years of history, replays what happened next, and only shows names
+        where the evidence actually points somewhere.
+      </p>
+
+      <form class="check-form" id="checkForm" role="search">
+        <label class="sr-only" for="checkInput">Check any ticker</label>
+        <input id="checkInput" autocomplete="off" spellcheck="false" maxlength="12"
+               placeholder="Check any ticker — NVDA, AAPL, BTC-USD…">
+        <button type="submit" id="checkButton">Check it</button>
+      </form>
+      <div class="quick-picks">
+        <span>Try:</span>
+        <button type="button" data-symbol="NVDA">NVDA</button>
+        <button type="button" data-symbol="AAPL">AAPL</button>
+        <button type="button" data-symbol="TSLA">TSLA</button>
+        <button type="button" data-symbol="SPY">SPY</button>
+        <button type="button" data-symbol="BTC-USD">BTC</button>
+      </div>
+    </section>
+
+    <section class="check-panel" id="checkPanel" hidden aria-live="polite">
+      <div class="check-loading" id="checkLoading" hidden>
+        <div class="loading-track"><div class="loading-bar" id="checkBar"></div></div>
+        <p id="checkLoadingText">Fingerprinting the setup and running the untouched audit…</p>
+      </div>
+      <p class="check-error" id="checkError" hidden></p>
+      <div id="checkCard"></div>
+    </section>
+
+    <section class="board-section" id="boardSection">
+      <div class="board-tabs" role="tablist" aria-label="Signal direction">
+        <button role="tab" class="tab is-active" id="tabLong" data-side="long" aria-selected="true">
+          <span class="tab-icon up-text">▲</span>
+          <span class="tab-title">Buy signals</span>
+          <span class="tab-count" id="longCount">—</span>
+        </button>
+        <button role="tab" class="tab" id="tabShort" data-side="short" aria-selected="false">
+          <span class="tab-icon down-text">▼</span>
+          <span class="tab-title">Short signals</span>
+          <span class="tab-count" id="shortCount">—</span>
+        </button>
+      </div>
+
+      <div class="board-controls">
+        <div class="filter-group" role="group" aria-label="Signal strength filter">
+          <button type="button" class="chip is-active" data-tier="quality">Strong + moderate</button>
+          <button type="button" class="chip" data-tier="strong">Strong only</button>
+          <button type="button" class="chip" data-tier="all">Everything</button>
+        </div>
+        <p class="board-note" id="boardNote"></p>
+      </div>
+
+      <div class="board-list" id="boardList"></div>
+      <p class="board-empty" id="boardEmpty" hidden></p>
+    </section>
+
+    <section class="active-scan" id="activeScan" hidden>
+      <div>
+        <strong>A newer scan is running right now</strong>
+        <span id="activeScanText"></span>
+      </div>
+      <div class="loading-track" aria-hidden="true">
+        <div class="loading-bar" id="activeScanBar"></div>
+      </div>
+    </section>
+
+    <details class="how-it-works">
+      <summary>How a signal gets on this list</summary>
+      <div class="how-grid">
+        <article>
+          <strong>1 · Fingerprint</strong>
+          <p>Momentum, trend, volatility, drawdown, volume, candlestick pressure, and the shape of the last month become one description of today.</p>
+        </article>
+        <article>
+          <strong>2 · Find the twins</strong>
+          <p>Up to twenty years of history is searched for independent look-alike setups, then their real next month is replayed.</p>
+        </article>
+        <article>
+          <strong>3 · Audit the method</strong>
+          <p>The same matcher is replayed on untouched past dates. A poor audit downgrades the signal instead of being hidden.</p>
+        </article>
+        <article>
+          <strong>4 · Charge for risk</strong>
+          <p>Adverse movement, wide uncertainty, and headlines that fight the historical lean all subtract from the score.</p>
+        </article>
+      </div>
+      <p class="how-note" id="methodologyNote"></p>
+    </details>
+  </main>
+
+  <footer>
+    <p><strong>Playbook</strong> ranks historical evidence, not guaranteed returns. A signal is a distribution of past outcomes, not a promise. Earnings, policy, liquidity shocks, and unprecedented events can invalidate every analog. This is research, not financial advice.</p>
+  </footer>
+</body>
+</html>

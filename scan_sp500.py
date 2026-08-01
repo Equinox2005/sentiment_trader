@@ -1,9 +1,17 @@
+"""Run Playbook's after-close market scan.
+
+Kept at this filename for backward compatibility; the universe is configurable
+and defaults to the full Nasdaq common-stock listing merged with the S&P 500.
+"""
+
 import argparse
 import os
 
 from market_data import MarketIntelligenceService, YahooFinanceProvider
 from scanner import (
     DEFAULT_SCAN_TIME,
+    DEFAULT_UNIVERSE_SCOPE,
+    MarketUniverseProvider,
     OpportunityScanner,
     ScanGateError,
     UniverseError,
@@ -23,6 +31,11 @@ def build_scanner(args):
     return OpportunityScanner(
         service,
         store,
+        universe_provider=MarketUniverseProvider(
+            store,
+            scope=args.universe,
+            max_symbols=args.max_symbols,
+        ),
         workers=args.workers,
         scan_time=args.scan_time,
     )
@@ -30,7 +43,7 @@ def build_scanner(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run Playbook's after-close S&P 500 opportunity scanner."
+        description="Run Playbook's after-close market opportunity scanner."
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="Run one eligible scan.")
@@ -40,10 +53,25 @@ def main(argv=None):
         help="Stay running and scan after each configured close.",
     )
     parser.add_argument(
+        "--universe",
+        choices=("nasdaq", "us", "sp500"),
+        default=os.getenv("PLAYBOOK_UNIVERSE", DEFAULT_UNIVERSE_SCOPE),
+        help=(
+            "nasdaq: every Nasdaq common stock plus the S&P 500 (default). "
+            "us: adds NYSE and NYSE American. sp500: the index only."
+        ),
+    )
+    parser.add_argument(
+        "--max-symbols",
+        type=int,
+        default=int(os.getenv("PLAYBOOK_MAX_SYMBOLS") or 0) or None,
+        help="Cap the universe size, useful for a first smoke run.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=int(os.getenv("PLAYBOOK_SCAN_WORKERS", "3")),
-        help="Concurrent full analyses (default: 3, maximum: 8).",
+        help="Concurrent full analyses (default: 3, maximum: 16).",
     )
     parser.add_argument(
         "--scan-time",

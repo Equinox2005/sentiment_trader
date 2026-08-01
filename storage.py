@@ -149,6 +149,7 @@ class PlaybookStore:
                     status TEXT NOT NULL DEFAULT 'pending',
                     claim_owner TEXT,
                     eligible INTEGER NOT NULL DEFAULT 0,
+                    side TEXT,
                     opportunity_score REAL,
                     rank INTEGER,
                     payload_json TEXT,
@@ -163,7 +164,7 @@ class PlaybookStore:
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS scan_results_run_rank
-                ON scan_results(run_id, eligible, rank)
+                ON scan_results(run_id, eligible, side, rank)
                 """
             )
             columns = {
@@ -202,6 +203,10 @@ class PlaybookStore:
             if "claim_owner" not in scan_result_columns:
                 connection.execute(
                     "ALTER TABLE scan_results ADD COLUMN claim_owner TEXT"
+                )
+            if "side" not in scan_result_columns:
+                connection.execute(
+                    "ALTER TABLE scan_results ADD COLUMN side TEXT"
                 )
             connection.commit()
 
@@ -852,6 +857,7 @@ class PlaybookStore:
             if payload and payload.get("opportunity_score") is not None
             else None
         )
+        side = payload.get("side") if payload else None
         timestamp = _iso_utc(now)
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -861,6 +867,7 @@ class PlaybookStore:
                 SET status = ?,
                     claim_owner = NULL,
                     eligible = ?,
+                    side = ?,
                     opportunity_score = ?,
                     payload_json = ?,
                     error = ?,
@@ -881,6 +888,7 @@ class PlaybookStore:
                 (
                     status,
                     int(eligible),
+                    side,
                     score,
                     encoded,
                     error,
@@ -958,24 +966,34 @@ class PlaybookStore:
                     int(run_id),
                 ),
             )
-            ranked = connection.execute(
-                """
-                SELECT symbol
-                FROM scan_results
-                WHERE run_id = ? AND eligible = 1 AND status = 'completed'
-                ORDER BY opportunity_score DESC, symbol
-                """,
+            connection.execute(
+                "UPDATE scan_results SET rank = NULL WHERE run_id = ?",
                 (int(run_id),),
-            ).fetchall()
+            )
+            updates = []
+            for side in ("long", "short"):
+                ranked = connection.execute(
+                    """
+                    SELECT symbol
+                    FROM scan_results
+                    WHERE run_id = ?
+                      AND eligible = 1
+                      AND status = 'completed'
+                      AND side = ?
+                    ORDER BY opportunity_score DESC, symbol
+                    """,
+                    (int(run_id), side),
+                ).fetchall()
+                updates.extend(
+                    (rank, int(run_id), row["symbol"])
+                    for rank, row in enumerate(ranked, start=1)
+                )
             connection.executemany(
                 """
                 UPDATE scan_results SET rank = ?
                 WHERE run_id = ? AND symbol = ?
                 """,
-                [
-                    (rank, int(run_id), row["symbol"])
-                    for rank, row in enumerate(ranked, start=1)
-                ],
+                updates,
             )
             connection.commit()
         return self.get_scan_run(run_id, include_results=True)
@@ -1026,6 +1044,7 @@ class PlaybookStore:
                     WHERE run_id = ?
                     ORDER BY
                         CASE WHEN rank IS NULL THEN 1 ELSE 0 END,
+                        CASE side WHEN 'long' THEN 0 WHEN 'short' THEN 1 ELSE 2 END,
                         rank,
                         symbol
                     """,

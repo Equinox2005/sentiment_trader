@@ -8,6 +8,7 @@ import pandas as pd
 from market_data import MarketDataError
 from scanner import (
     ALGORITHM_VERSION,
+    MarketUniverseProvider,
     OpportunityBoardService,
     OpportunityScanner,
     SP500UniverseProvider,
@@ -15,6 +16,9 @@ from scanner import (
     UniverseError,
     compact_scan_result,
     confirmed_scan_session,
+    merge_universes,
+    parse_nasdaq_listed,
+    parse_other_listed,
     parse_sp500_constituents,
     rank_analysis,
 )
@@ -26,7 +30,18 @@ def spy_history(date="2025-06-10"):
     return pd.DataFrame({"Close": [600.0]}, index=index)
 
 
-def audited_analysis(symbol="AAA", grade="positive", typical=8.0, low=-4.0):
+def audited_analysis(
+    symbol="AAA",
+    grade="positive",
+    typical=8.0,
+    low=-4.0,
+    high=18.0,
+    direction="bullish",
+    analog_direction=None,
+    edge=13,
+    probability_up=68,
+):
+    analog_direction = analog_direction or direction
     return {
         "symbol": symbol,
         "name": f"{symbol} Company",
@@ -38,21 +53,21 @@ def audited_analysis(symbol="AAA", grade="positive", typical=8.0, low=-4.0):
             "available": True,
             "matching": {"match_count": 30},
             "stats": {"effective_matches": 14.5, "distinct_years": 10},
-            "verdict": {"direction": "bullish"},
+            "verdict": {"direction": direction},
             "forecast": {
                 "horizon_days": 21,
                 "horizon_label": "21 sessions",
-                "direction": "bullish",
-                "analog_direction": "bullish",
-                "probability_up": 68,
+                "direction": direction,
+                "analog_direction": analog_direction,
+                "probability_up": probability_up,
                 "analog_probability_up": 67,
                 "baseline_up_rate": 54,
-                "edge_points": 13,
+                "edge_points": edge,
                 "evidence_score": 82,
                 "range_21d": {
                     "low": low,
                     "typical": typical,
-                    "high": 18.0,
+                    "high": high,
                 },
                 "agreement": {"score": 88, "label": "Broad agreement"},
             },
@@ -67,6 +82,24 @@ def audited_analysis(symbol="AAA", grade="positive", typical=8.0, low=-4.0):
             },
         },
     }
+
+
+def bearish_analysis(symbol="BEAR", typical=-9.0, low=-20.0, high=3.0):
+    return audited_analysis(
+        symbol=symbol,
+        typical=typical,
+        low=low,
+        high=high,
+        direction="bearish",
+        edge=-13,
+        probability_up=31,
+    )
+
+
+NASDAQ_HEADER = (
+    "Symbol|Security Name|Market Category|Test Issue|Financial Status|"
+    "Round Lot Size|ETF|NextShares"
+)
 
 
 class ScannerTests(unittest.TestCase):
@@ -140,13 +173,141 @@ class ScannerTests(unittest.TestCase):
             "2025-06-10",
         )
 
-    def test_only_positive_audit_is_eligible(self):
+    def test_parses_nasdaq_common_stocks_and_rejects_derivatives(self):
+        rows = [
+            f"SYM{index}|Company {index} - Common Stock|Q|N|N|100|N|N"
+            for index in range(1500)
+        ]
+        rows += [
+            "ABCDW|Alpha Corp - Warrants|Q|N|N|100|N|N",
+            "ABCDU|Alpha Corp - Units|Q|N|N|100|N|N",
+            "TESTX|Test Issue - Common Stock|Q|Y|N|100|N|N",
+            "FUNDX|Some Index Fund - ETF|Q|N|N|100|Y|N",
+            "SICKX|Sick Corp - Common Stock|Q|N|D|100|N|N",
+        ]
+        document = "\n".join([NASDAQ_HEADER, *rows, "File Creation Time: 0610202517:00"])
+
+        result = parse_nasdaq_listed(document)
+        symbols = {item["symbol"] for item in result}
+
+        self.assertEqual(len(result), 1500)
+        self.assertNotIn("ABCDW", symbols)
+        self.assertNotIn("ABCDU", symbols)
+        self.assertNotIn("TESTX", symbols)
+        self.assertNotIn("FUNDX", symbols)
+        self.assertNotIn("SICKX", symbols)
+        self.assertEqual(result[0]["name"], "Company 0")
+
+    def test_rejects_truncated_nasdaq_directory(self):
+        document = "\n".join(
+            [NASDAQ_HEADER, "AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N"]
+        )
+
+        with self.assertRaises(UniverseError):
+            parse_nasdaq_listed(document)
+
+    def test_other_listed_normalizes_class_share_symbols(self):
+        document = "\n".join(
+            [
+                "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|"
+                "Round Lot Size|Test Issue|NASDAQ Symbol",
+                "BRK.B|Berkshire Hathaway Inc. Class B|N|BRK B|N|100|N|BRK.B",
+            ]
+        )
+
+        result = parse_other_listed(document)
+
+        self.assertEqual(result[0]["symbol"], "BRK-B")
+        self.assertEqual(result[0]["display_symbol"], "BRK.B")
+
+    def test_merge_prefers_sector_metadata_from_the_index_table(self):
+        merged = merge_universes(
+            [{"symbol": "AAPL", "name": "Apple", "sector": "", "list": "Nasdaq"}],
+            [
+                {
+                    "symbol": "AAPL",
+                    "name": "Apple Inc.",
+                    "sector": "Information Technology",
+                    "list": "S&P 500",
+                }
+            ],
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["sector"], "Information Technology")
+        self.assertEqual(merged[0]["list"], "S&P 500")
+
+    def test_market_universe_falls_back_to_last_verified_snapshot(self):
+        cached = [
+            {
+                "symbol": f"S{index}",
+                "display_symbol": f"S{index}",
+                "name": f"Company {index}",
+                "sector": "Sector",
+            }
+            for index in range(1500)
+        ]
+        self.store.save_scan_universe(cached, "verified")
+
+        def unavailable(*_args, **_kwargs):
+            raise OSError("offline")
+
+        result = MarketUniverseProvider(
+            self.store,
+            scope="nasdaq",
+            opener=unavailable,
+        ).load()
+
+        self.assertTrue(result["stale"])
+        self.assertEqual(len(result["constituents"]), 1500)
+
+    def test_bullish_and_bearish_setups_reach_opposite_boards(self):
+        long_signal = rank_analysis(audited_analysis())
+        short_signal = rank_analysis(bearish_analysis())
+
+        self.assertEqual(long_signal["side"], "long")
+        self.assertEqual(short_signal["side"], "short")
+        self.assertTrue(long_signal["eligible"])
+        self.assertTrue(short_signal["eligible"])
+        self.assertIn("BUY", long_signal["signal"])
+        self.assertIn("SHORT", short_signal["signal"])
+        # A short's expected move and adverse move are read off the other tail.
+        self.assertAlmostEqual(short_signal["expected_move"], 9.0)
+        self.assertAlmostEqual(short_signal["adverse_move"], 3.0)
+
+    def test_neutral_analogs_stay_off_both_boards(self):
+        neutral = rank_analysis(
+            audited_analysis(direction="neutral", analog_direction="neutral")
+        )
+
+        self.assertFalse(neutral["eligible"])
+        self.assertIsNone(neutral["side"])
+
+    def test_audit_grade_downgrades_the_tier_without_hiding_the_name(self):
         positive = rank_analysis(audited_analysis())
         mixed = rank_analysis(audited_analysis(grade="mixed"))
+        weak = rank_analysis(audited_analysis(grade="weak"))
 
-        self.assertTrue(positive["eligible"])
-        self.assertFalse(mixed["eligible"])
-        self.assertIn("not positively graded", mixed["reason"])
+        self.assertEqual(positive["tier"], "strong")
+        self.assertEqual(mixed["tier"], "moderate")
+        self.assertEqual(weak["tier"], "speculative")
+        self.assertTrue(mixed["eligible"])
+        self.assertGreater(positive["opportunity_score"], mixed["opportunity_score"])
+        self.assertGreater(mixed["opportunity_score"], weak["opportunity_score"])
+
+    def test_news_conflict_is_flagged_and_penalized(self):
+        aligned = rank_analysis(audited_analysis())
+        conflicted = rank_analysis(
+            audited_analysis(direction="neutral", analog_direction="bullish")
+        )
+
+        self.assertFalse(aligned["news_conflict"])
+        self.assertTrue(conflicted["news_conflict"])
+        self.assertNotEqual(conflicted["tier"], "strong")
+        self.assertGreater(
+            aligned["opportunity_score"],
+            conflicted["opportunity_score"],
+        )
 
     def test_downside_penalty_reduces_rank_score(self):
         lower_risk = rank_analysis(audited_analysis(low=-2))
@@ -156,6 +317,12 @@ class ScannerTests(unittest.TestCase):
             lower_risk["opportunity_score"],
             higher_risk["opportunity_score"],
         )
+
+    def test_tiny_expected_move_is_rejected(self):
+        result = rank_analysis(audited_analysis(typical=0.6))
+
+        self.assertFalse(result["eligible"])
+        self.assertIn("typical historical move", result["reason"])
 
     def test_scan_run_is_immutable_and_expired_lease_resumes(self):
         universe_id = self.store.save_scan_universe(
@@ -275,6 +442,8 @@ class ScannerTests(unittest.TestCase):
             def analyze(self, symbol, force_refresh=False, include_validation=True):
                 if symbol == "BAD":
                     raise MarketDataError("missing")
+                if symbol == "SHT":
+                    return bearish_analysis(symbol)
                 return audited_analysis(
                     symbol,
                     typical=12.0 if symbol == "BBB" else 8.0,
@@ -285,6 +454,7 @@ class ScannerTests(unittest.TestCase):
                 constituents = [
                     {"symbol": "AAA", "name": "A", "sector": "Tech"},
                     {"symbol": "BBB", "name": "B", "sector": "Health"},
+                    {"symbol": "SHT", "name": "S", "sector": "Energy"},
                     {"symbol": "BAD", "name": "B", "sector": "Tech"},
                 ]
                 universe_id = self_store.save_scan_universe(
@@ -314,15 +484,50 @@ class ScannerTests(unittest.TestCase):
         board = OpportunityBoardService(self.store).latest()
 
         self.assertEqual(first["status"], "partial")
-        self.assertEqual(first["completed_count"], 2)
+        self.assertEqual(first["completed_count"], 3)
         self.assertEqual(first["failed_count"], 1)
         self.assertFalse(second["started"])
         self.assertTrue(board["available"])
-        self.assertEqual(board["opportunities"][0]["symbol"], "BBB")
-        self.assertEqual(board["opportunities"][0]["rank"], 1)
-        self.assertEqual(board["opportunities"][1]["symbol"], "AAA")
-        self.assertEqual(board["opportunities"][1]["rank"], 2)
-        self.assertEqual(board["eligible_count"], 2)
+        self.assertEqual(board["longs"][0]["symbol"], "BBB")
+        self.assertEqual(board["longs"][0]["rank"], 1)
+        self.assertEqual(board["longs"][1]["symbol"], "AAA")
+        self.assertEqual(board["longs"][1]["rank"], 2)
+        self.assertEqual(board["long_count"], 2)
+        # Shorts are ranked independently, so the best short is also rank 1.
+        self.assertEqual(board["shorts"][0]["symbol"], "SHT")
+        self.assertEqual(board["shorts"][0]["rank"], 1)
+        self.assertEqual(board["short_count"], 1)
+        self.assertEqual(board["eligible_count"], 3)
+
+    def test_board_can_be_restricted_to_one_side(self):
+        universe_id = self.store.save_scan_universe(
+            [{"symbol": "AAA", "name": "A", "sector": "Tech"}], "test"
+        )
+        now = datetime(2025, 6, 10, 22, tzinfo=timezone.utc)
+        run, _ = self.store.acquire_scan_run(
+            "2025-06-10",
+            ALGORITHM_VERSION,
+            universe_id,
+            [{"symbol": "AAA", "name": "A", "sector": "Tech"}],
+            "owner",
+            now=now,
+        )
+        self.store.claim_scan_symbol(run["id"], "AAA", "owner", now=now)
+        self.store.save_scan_result(
+            run["id"],
+            "AAA",
+            "completed",
+            "owner",
+            payload=compact_scan_result(audited_analysis("AAA")),
+            now=now,
+        )
+        self.store.finish_scan_run(run["id"], "owner", now=now)
+
+        board = OpportunityBoardService(self.store)
+
+        self.assertEqual(len(board.latest(side="long")["longs"]), 1)
+        self.assertEqual(board.latest(side="short")["longs"], [])
+        self.assertEqual(board.latest(side="short")["long_count"], 1)
 
     def test_scanner_rejects_symbol_from_wrong_price_session(self):
         class Provider:
@@ -364,11 +569,13 @@ class ScannerTests(unittest.TestCase):
         result = compact_scan_result(audited_analysis())
 
         self.assertTrue(result["eligible"])
+        self.assertEqual(result["side"], "long")
         self.assertEqual(result["validation_grade"], "positive")
         self.assertEqual(
             result["ranking_factors"]["predicted_increase"],
             8.0,
         )
+        self.assertEqual(result["ranking_factors"]["adverse_move"], 4.0)
 
 
 if __name__ == "__main__":

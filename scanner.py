@@ -1,9 +1,9 @@
 import html
 import math
 import os
+import re
 import socket
 import threading
-import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as clock_time, timezone
@@ -16,10 +16,29 @@ import pandas as pd
 from market_data import MarketDataError
 
 
-ALGORITHM_VERSION = "sp500-opportunity-v1"
+ALGORITHM_VERSION = "opportunity-v2"
 UNIVERSE_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
 MIN_UNIVERSE_SIZE = 450
+MIN_NASDAQ_UNIVERSE_SIZE = 1500
 DEFAULT_SCAN_TIME = "17:15"
+DEFAULT_UNIVERSE_SCOPE = "nasdaq"
+
+# Derivative share classes that are not ordinary tradable equity exposure.
+_NON_COMMON_NAME = re.compile(
+    r"\b("
+    r"warrant|warrants|right|rights|unit|units|preferred|depositary share|"
+    r"notes? due|debenture|subordinated|trust preferred|contingent value"
+    r")\b",
+    re.IGNORECASE,
+)
+_NON_COMMON_SUFFIX = ("W", "R", "U", "P")
+
+# Minimum quality gates before a symbol may appear on the board at all.
+MIN_BOARD_SCORE = 18.0
+MIN_EXPECTED_MOVE = 1.5
+MIN_PRICE = 2.0
 
 
 class UniverseError(RuntimeError):
@@ -79,61 +98,34 @@ class _ConstituentTableParser(HTMLParser):
             self.cell_parts.append(data)
 
 
-class SP500UniverseProvider:
-    def __init__(
-        self,
-        store,
-        url=UNIVERSE_URL,
-        timeout_seconds=20,
-        opener=None,
-    ):
-        self.store = store
-        self.url = url
-        self.timeout_seconds = timeout_seconds
-        self.opener = opener or urlopen
+def _fetch_text(opener, url, timeout_seconds):
+    request = Request(
+        url,
+        headers={"User-Agent": "Playbook opportunity scanner/2.0"},
+    )
+    with opener(request, timeout=timeout_seconds) as response:
+        body = response.read().decode("utf-8", errors="replace")
+        stamp = response.headers.get("Last-Modified")
+    return body, stamp
 
-    def load(self, now=None):
-        warning = None
-        try:
-            request = Request(
-                self.url,
-                headers={"User-Agent": "Playbook opportunity scanner/1.0"},
-            )
-            with self.opener(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8", errors="replace")
-                source_timestamp = response.headers.get("Last-Modified")
-            constituents = parse_sp500_constituents(body)
-            universe_id = self.store.save_scan_universe(
-                constituents,
-                source=self.url,
-                source_timestamp=source_timestamp,
-                now=now,
-            )
-            return {
-                "id": universe_id,
-                "constituents": constituents,
-                "source": self.url,
-                "source_timestamp": source_timestamp,
-                "fetched_at": _iso(now),
-                "stale": False,
-                "warning": None,
-            }
-        except (OSError, TimeoutError, UnicodeError, UniverseError) as exc:
-            warning = (
-                "The live S&P 500 constituent list was unavailable; "
-                "the last verified universe snapshot is in use."
-            )
-            cached = self.store.latest_scan_universe()
-            if cached is None:
-                raise UniverseError(
-                    "The S&P 500 universe could not be verified and no "
-                    "last-known-good snapshot exists."
-                ) from exc
-            return {
-                **cached,
-                "stale": True,
-                "warning": warning,
-            }
+
+def _looks_like_common_stock(symbol, name):
+    if not symbol or not name:
+        return False
+    if "$" in symbol or "^" in symbol:
+        return False
+    if _NON_COMMON_NAME.search(name):
+        return False
+    # A fifth character on a Nasdaq ticker encodes the issue type; W/R/U/P are
+    # warrants, rights, units, and preferreds rather than ordinary shares.
+    if len(symbol) == 5 and symbol[-1] in _NON_COMMON_SUFFIX:
+        return False
+    return True
+
+
+def _clean_company_name(name):
+    trimmed = name.split(" - ")[0].strip()
+    return trimmed or name.strip()
 
 
 def parse_sp500_constituents(document):
@@ -166,6 +158,7 @@ def parse_sp500_constituents(document):
                 "display_symbol": display_symbol,
                 "name": row[name_index].strip(),
                 "sector": row[sector_index].strip(),
+                "list": "S&P 500",
             }
         )
     if len(constituents) < MIN_UNIVERSE_SIZE:
@@ -174,6 +167,219 @@ def parse_sp500_constituents(document):
             "the universe was rejected as incomplete."
         )
     return constituents
+
+
+def _parse_symbol_directory(document, columns, exchange_label):
+    lines = [line for line in document.splitlines() if line.strip()]
+    if not lines:
+        raise UniverseError(f"The {exchange_label} symbol directory was empty.")
+    headers = [part.strip() for part in lines[0].split("|")]
+    try:
+        indexes = {key: headers.index(header) for key, header in columns.items()}
+    except ValueError as exc:
+        raise UniverseError(
+            f"The {exchange_label} symbol directory format changed."
+        ) from exc
+    required = max(indexes.values())
+    constituents = []
+    seen = set()
+    for line in lines[1:]:
+        if line.startswith("File Creation Time"):
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) <= required:
+            continue
+        if parts[indexes["test_issue"]].upper() == "Y":
+            continue
+        if parts[indexes["etf"]].upper() == "Y":
+            continue
+        status_index = indexes.get("financial_status")
+        if status_index is not None:
+            status = parts[status_index].upper()
+            if status and status not in {"N"}:
+                continue
+        display_symbol = parts[indexes["symbol"]].upper()
+        name = parts[indexes["name"]]
+        if not _looks_like_common_stock(display_symbol, name):
+            continue
+        symbol = display_symbol.replace(".", "-")
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        constituents.append(
+            {
+                "symbol": symbol,
+                "display_symbol": display_symbol,
+                "name": _clean_company_name(name),
+                "sector": "",
+                "list": exchange_label,
+            }
+        )
+    return constituents
+
+
+def parse_nasdaq_listed(document):
+    constituents = _parse_symbol_directory(
+        document,
+        {
+            "symbol": "Symbol",
+            "name": "Security Name",
+            "test_issue": "Test Issue",
+            "financial_status": "Financial Status",
+            "etf": "ETF",
+        },
+        "Nasdaq",
+    )
+    if len(constituents) < MIN_NASDAQ_UNIVERSE_SIZE:
+        raise UniverseError(
+            f"Only {len(constituents)} Nasdaq common stocks were parsed; "
+            "the universe was rejected as incomplete."
+        )
+    return constituents
+
+
+def parse_other_listed(document):
+    return _parse_symbol_directory(
+        document,
+        {
+            "symbol": "ACT Symbol",
+            "name": "Security Name",
+            "test_issue": "Test Issue",
+            "etf": "ETF",
+        },
+        "NYSE / NYSE American",
+    )
+
+
+def merge_universes(*groups):
+    merged = {}
+    for group in groups:
+        for item in group or []:
+            symbol = item["symbol"]
+            existing = merged.get(symbol)
+            if existing is None:
+                merged[symbol] = dict(item)
+                continue
+            # Prefer the richer record: the S&P table carries sector metadata.
+            if not existing.get("sector") and item.get("sector"):
+                existing["sector"] = item["sector"]
+            if item.get("list") == "S&P 500":
+                existing["list"] = "S&P 500"
+    return [merged[symbol] for symbol in sorted(merged)]
+
+
+class MarketUniverseProvider:
+    """Builds the daily scan universe from public listing directories."""
+
+    def __init__(
+        self,
+        store,
+        scope=None,
+        timeout_seconds=30,
+        opener=None,
+        max_symbols=None,
+    ):
+        self.store = store
+        self.scope = (scope or os.getenv("PLAYBOOK_UNIVERSE", DEFAULT_UNIVERSE_SCOPE)).lower()
+        self.timeout_seconds = timeout_seconds
+        self.opener = opener or urlopen
+        env_max = os.getenv("PLAYBOOK_MAX_SYMBOLS") or ""
+        self.max_symbols = (
+            int(max_symbols)
+            if max_symbols is not None
+            else (int(env_max) if env_max.strip().isdigit() else None)
+        )
+
+    def _sources(self):
+        if self.scope == "sp500":
+            return [(UNIVERSE_URL, parse_sp500_constituents, True)]
+        if self.scope == "us":
+            return [
+                (NASDAQ_LISTED_URL, parse_nasdaq_listed, True),
+                (OTHER_LISTED_URL, parse_other_listed, False),
+                (UNIVERSE_URL, parse_sp500_constituents, False),
+            ]
+        return [
+            (NASDAQ_LISTED_URL, parse_nasdaq_listed, True),
+            (UNIVERSE_URL, parse_sp500_constituents, False),
+        ]
+
+    def load(self, now=None):
+        groups = []
+        sources = []
+        stamps = []
+        soft_failures = []
+        try:
+            for url, parser, required in self._sources():
+                try:
+                    body, stamp = _fetch_text(
+                        self.opener, url, self.timeout_seconds
+                    )
+                    groups.append(parser(body))
+                    sources.append(url)
+                    if stamp:
+                        stamps.append(stamp)
+                except (OSError, TimeoutError, UnicodeError, UniverseError):
+                    if required:
+                        raise
+                    soft_failures.append(url)
+            constituents = merge_universes(*groups)
+            if not constituents:
+                raise UniverseError("No listed common stocks were parsed.")
+            if self.max_symbols:
+                constituents = constituents[: self.max_symbols]
+            universe_id = self.store.save_scan_universe(
+                constituents,
+                source=" + ".join(sources),
+                source_timestamp=stamps[0] if stamps else None,
+                now=now,
+            )
+            warning = (
+                "Part of the listing directory was unavailable; the universe "
+                f"was built without {', '.join(soft_failures)}."
+                if soft_failures
+                else None
+            )
+            return {
+                "id": universe_id,
+                "constituents": constituents,
+                "source": " + ".join(sources),
+                "source_timestamp": stamps[0] if stamps else None,
+                "fetched_at": _iso(now),
+                "stale": False,
+                "warning": warning,
+            }
+        except (OSError, TimeoutError, UnicodeError, UniverseError) as exc:
+            cached = self.store.latest_scan_universe()
+            if cached is None:
+                raise UniverseError(
+                    "The scan universe could not be verified and no "
+                    "last-known-good snapshot exists."
+                ) from exc
+            return {
+                **cached,
+                "stale": True,
+                "warning": (
+                    "The live listing directory was unavailable; the last "
+                    "verified universe snapshot is in use."
+                ),
+            }
+
+
+class SP500UniverseProvider(MarketUniverseProvider):
+    """Backward-compatible S&P 500 only universe."""
+
+    def __init__(self, store, url=UNIVERSE_URL, timeout_seconds=20, opener=None):
+        super().__init__(
+            store,
+            scope="sp500",
+            timeout_seconds=timeout_seconds,
+            opener=opener,
+        )
+        self.url = url
+
+    def _sources(self):
+        return [(self.url, parse_sp500_constituents, True)]
 
 
 def confirmed_scan_session(history, now=None, scan_time=DEFAULT_SCAN_TIME):
@@ -199,83 +405,204 @@ def confirmed_scan_session(history, now=None, scan_time=DEFAULT_SCAN_TIME):
     return latest.isoformat()
 
 
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+AUDIT_POINTS = {"positive": 14.0, "mixed": 9.0, "limited": 5.0, "weak": 2.0}
+SIGNAL_LABELS = {
+    ("long", "strong"): "STRONG BUY",
+    ("long", "moderate"): "BUY",
+    ("long", "speculative"): "WEAK BUY",
+    ("short", "strong"): "STRONG SHORT",
+    ("short", "moderate"): "SHORT",
+    ("short", "speculative"): "WEAK SHORT",
+}
+
+
 def rank_analysis(analysis):
+    """Score a completed analysis for both the long and short board."""
+
     play = analysis.get("playbook", {})
     if not play.get("available"):
         return {
             "eligible": False,
+            "side": None,
             "reason": play.get("reason", "No analog forecast was available."),
         }
+
     forecast = play["forecast"]
     validation = play.get("validation", {})
     agreement = forecast.get("agreement", {})
     range_data = forecast["range_21d"]
+
     typical = float(range_data["typical"])
-    downside = max(0.0, -float(range_data["low"]))
-    width = max(0.0, float(range_data["high"]) - float(range_data["low"]))
+    low = float(range_data["low"])
+    high = float(range_data["high"])
+    width = max(0.0, high - low)
     edge = float(forecast["edge_points"])
     evidence = float(forecast["evidence_score"])
     agreement_score = float(agreement.get("score", 0))
-    brier_skill = float(validation.get("brier_skill", -100))
-    reasons = []
-    checks = (
-        (validation.get("available"), "The untouched audit is unavailable."),
-        (
-            validation.get("grade") == "positive",
-            "The untouched audit is not positively graded.",
-        ),
-        (
-            forecast.get("analog_direction") == "bullish",
-            "Historical analogs do not show a bullish edge.",
-        ),
-        (
-            forecast.get("direction") == "bullish",
-            "Current evidence cancels the bullish historical lean.",
-        ),
-        (typical > 0.5, "Projected median upside is too small."),
-        (edge >= 4, "The analog edge is below four probability points."),
-        (evidence >= 50, "Independent evidence is too thin."),
-        (agreement_score >= 50, "The evidence components conflict."),
+    brier_skill = float(validation.get("brier_skill") or -100)
+    grade = validation.get("grade")
+    probability_up = float(forecast.get("probability_up", 50))
+    analog_direction = forecast.get("analog_direction")
+    direction = forecast.get("direction")
+    price = float(analysis.get("quote", {}).get("price") or 0)
+
+    if analog_direction == "bullish":
+        side = "long"
+    elif analog_direction == "bearish":
+        side = "short"
+    else:
+        return {
+            "eligible": False,
+            "side": None,
+            "reason": (
+                "The closest historical setups did not lean far enough in "
+                "either direction to be worth acting on."
+            ),
+        }
+
+    news_conflict = direction != analog_direction
+    if side == "long":
+        expected_move = typical
+        adverse_move = max(0.0, -low)
+        favorable_move = max(0.0, high)
+        win_probability = probability_up
+    else:
+        expected_move = -typical
+        adverse_move = max(0.0, high)
+        favorable_move = max(0.0, -low)
+        win_probability = 100.0 - probability_up
+
+    reward_risk = expected_move / max(adverse_move, 0.5)
+
+    move_points = _clamp(expected_move / 12.0 * 30.0, 0.0, 30.0)
+    edge_points = _clamp(abs(edge) / 15.0 * 22.0, 0.0, 22.0)
+    evidence_points = _clamp(evidence / 100.0 * 16.0, 0.0, 16.0)
+    agreement_points = _clamp(agreement_score / 100.0 * 10.0, 0.0, 10.0)
+    audit_points = AUDIT_POINTS.get(grade, 0.0)
+    skill_points = _clamp(max(0.0, brier_skill) / 25.0 * 8.0, 0.0, 8.0)
+    risk_penalty = _clamp(adverse_move / 15.0 * 14.0, 0.0, 14.0)
+    width_penalty = _clamp(width / 45.0 * 6.0, 0.0, 6.0)
+    news_penalty = 8.0 if news_conflict else 0.0
+
+    score = _clamp(
+        move_points
+        + edge_points
+        + evidence_points
+        + agreement_points
+        + audit_points
+        + skill_points
+        - risk_penalty
+        - width_penalty
+        - news_penalty,
+        0.0,
+        100.0,
     )
-    for passed, reason in checks:
-        if not passed:
-            reasons.append(reason)
+
+    blockers = []
+    if not validation.get("available"):
+        blockers.append("The untouched walk-forward audit could not run.")
+    if expected_move < MIN_EXPECTED_MOVE:
+        blockers.append(
+            f"The typical historical move was under {MIN_EXPECTED_MOVE:.1f}%."
+        )
+    if price and price < MIN_PRICE:
+        blockers.append(f"The share price is below ${MIN_PRICE:.0f}.")
+    if score < MIN_BOARD_SCORE:
+        blockers.append("Risk and uncertainty cancelled the historical edge.")
+
+    strong = (
+        not blockers
+        and not news_conflict
+        and grade == "positive"
+        and abs(edge) >= 6
+        and evidence >= 55
+        and agreement_score >= 55
+        and score >= 62
+    )
+    moderate = (
+        not blockers
+        and grade in {"positive", "mixed"}
+        and abs(edge) >= 4
+        and score >= 40
+    )
+    tier = "strong" if strong else "moderate" if moderate else "speculative"
+    signal = SIGNAL_LABELS[(side, tier)]
 
     factors = {
-        "predicted_increase": round(typical, 2),
+        "expected_move": round(expected_move, 2),
+        "adverse_move": round(adverse_move, 2),
+        "favorable_move": round(favorable_move, 2),
+        "reward_risk": round(reward_risk, 2),
         "analog_edge": round(edge, 1),
         "evidence_score": round(evidence),
         "agreement_score": round(agreement_score),
         "brier_skill": round(brier_skill, 1),
-        "downside_estimate": round(downside, 2),
         "interval_width": round(width, 2),
+        "predicted_increase": round(typical, 2),
+        "downside_estimate": round(max(0.0, -low), 2),
     }
-    upside_points = min(35.0, max(0.0, typical) / 15.0 * 35.0)
-    edge_points = min(20.0, max(0.0, edge) / 15.0 * 20.0)
-    evidence_points = min(15.0, evidence / 100.0 * 15.0)
-    agreement_points = min(10.0, agreement_score / 100.0 * 10.0)
-    skill_points = min(10.0, max(0.0, brier_skill) / 25.0 * 10.0)
-    downside_penalty = min(15.0, downside / 15.0 * 15.0)
-    width_penalty = min(5.0, width / 40.0 * 5.0)
-    score = max(
-        0.0,
-        upside_points
-        + edge_points
-        + evidence_points
-        + agreement_points
-        + skill_points
-        - downside_penalty
-        - width_penalty,
-    )
+
     return {
-        "eligible": not reasons,
-        "reason": " ".join(reasons) if reasons else (
-            "Positive untouched audit, bullish analog edge, sufficient "
-            "evidence, and non-conflicting path agreement."
-        ),
+        "eligible": not blockers,
+        "side": side,
+        "tier": tier,
+        "signal": signal,
+        "news_conflict": news_conflict,
         "opportunity_score": round(score, 1),
+        "expected_move": round(expected_move, 2),
+        "adverse_move": round(adverse_move, 2),
+        "reward_risk": round(reward_risk, 2),
+        "win_probability": round(win_probability),
+        "reason": (
+            " ".join(blockers)
+            if blockers
+            else _plain_reason(
+                side,
+                tier,
+                win_probability,
+                expected_move,
+                adverse_move,
+                grade,
+                news_conflict,
+                forecast.get("horizon_label", "the next month"),
+            )
+        ),
         "ranking_factors": factors,
     }
+
+
+def _plain_reason(
+    side,
+    tier,
+    win_probability,
+    expected_move,
+    adverse_move,
+    grade,
+    news_conflict,
+    horizon_label,
+):
+    action = "rose" if side == "long" else "fell"
+    lead = (
+        f"{round(win_probability)}% of the closest historical setups {action} "
+        f"over {horizon_label}, by about {expected_move:.1f}% in the typical "
+        f"case against roughly {adverse_move:.1f}% of adverse movement."
+    )
+    if tier == "strong":
+        support = " The untouched audit graded this matcher positively and every component agrees."
+    elif tier == "moderate":
+        support = f" The untouched audit graded this matcher {grade or 'inconclusive'}."
+    else:
+        support = " Evidence is thin, so treat this as a watchlist idea rather than a signal."
+    conflict = (
+        " Current headlines push against the historical lean."
+        if news_conflict
+        else ""
+    )
+    return lead + support + conflict
 
 
 def compact_scan_result(analysis):
@@ -325,8 +652,8 @@ class OpportunityScanner:
     ):
         self.service = service
         self.store = store
-        self.universe_provider = universe_provider or SP500UniverseProvider(store)
-        self.workers = max(1, min(8, int(workers)))
+        self.universe_provider = universe_provider or MarketUniverseProvider(store)
+        self.workers = max(1, min(16, int(workers)))
         self.lease_seconds = max(60, int(lease_seconds))
         self.scan_time = scan_time
         self.algorithm_version = algorithm_version
@@ -488,11 +815,20 @@ class OpportunityScanner:
             )
 
 
+BOARD_METHODOLOGY = (
+    "Every listed stock runs the same audited historical-analog engine. A name "
+    "reaches the buy board only when its closest past setups leaned up, and the "
+    "short board only when they leaned down. Expected move, probability edge, "
+    "evidence, agreement, and audited skill add score; adverse movement, "
+    "uncertainty, and conflicting news subtract it."
+)
+
+
 class OpportunityBoardService:
     def __init__(self, store):
         self.store = store
 
-    def latest(self, limit=25):
+    def latest(self, limit=50, side=None):
         latest = self.store.latest_completed_scan(include_results=True)
         active = self.store.active_scan_run()
         if latest is None:
@@ -500,19 +836,27 @@ class OpportunityBoardService:
                 "available": False,
                 "active_run": _public_run(active),
                 "message": (
-                    "No completed after-close S&P 500 scan exists yet. "
-                    "Run python scan_sp500.py --once after the market closes."
+                    "No completed market scan exists yet. Run "
+                    "python scan_sp500.py --once after the close."
                 ),
+                "longs": [],
+                "shorts": [],
                 "opportunities": [],
             }
         public = _public_run(latest)
-        all_eligible = [
+        results = latest.get("results", [])
+        bounded = max(1, min(250, int(limit)))
+        longs = [
             _public_result(item)
-            for item in latest.get("results", [])
-            if item.get("eligible")
+            for item in results
+            if item.get("eligible") and item.get("side") == "long"
         ]
-        eligible = all_eligible[: max(1, min(100, int(limit)))]
-        return {
+        shorts = [
+            _public_result(item)
+            for item in results
+            if item.get("eligible") and item.get("side") == "short"
+        ]
+        payload = {
             "available": True,
             "run": public,
             "active_run": (
@@ -520,14 +864,16 @@ class OpportunityBoardService:
                 if active and active["id"] != latest["id"]
                 else None
             ),
-            "eligible_count": len(all_eligible),
-            "opportunities": eligible,
-            "methodology": (
-                "Ranks only bullish forecasts with a positive untouched audit. "
-                "Projected median increase, analog edge, evidence, agreement, "
-                "and Brier skill add points; downside and interval width subtract them."
-            ),
+            "long_count": len(longs),
+            "short_count": len(shorts),
+            "eligible_count": len(longs) + len(shorts),
+            "longs": longs[:bounded] if side in (None, "long") else [],
+            "shorts": shorts[:bounded] if side in (None, "short") else [],
+            "methodology": BOARD_METHODOLOGY,
         }
+        # Backward-compatible flat list used by the previous board API.
+        payload["opportunities"] = payload["longs"]
+        return payload
 
     def history(self, limit=20):
         return {
@@ -582,7 +928,15 @@ def _public_result(item):
             "company_name",
             "sector",
             "rank",
+            "side",
+            "tier",
+            "signal",
+            "news_conflict",
             "opportunity_score",
+            "expected_move",
+            "adverse_move",
+            "reward_risk",
+            "win_probability",
             "name",
             "currency",
             "price",
@@ -608,6 +962,21 @@ def _public_result(item):
             "ranking_factors",
         )
     }
+
+
+def build_default_scanner(store, service=None, workers=None, scan_time=None):
+    """Create the scanner used by both the CLI and the hosted web process."""
+
+    if service is None:
+        from market_data import MarketIntelligenceService, YahooFinanceProvider
+
+        service = MarketIntelligenceService(YahooFinanceProvider(store=store))
+    return OpportunityScanner(
+        service,
+        store,
+        workers=int(workers or os.getenv("PLAYBOOK_SCAN_WORKERS", "3")),
+        scan_time=scan_time or os.getenv("PLAYBOOK_SCAN_TIME", DEFAULT_SCAN_TIME),
+    )
 
 
 def seconds_until_scan(now=None, scan_time=DEFAULT_SCAN_TIME):
@@ -647,6 +1016,8 @@ def run_scheduler(scanner, stop_event=None):
                     last_resolved_date = local_date
             except (ScanGateError, UniverseError, MarketDataError) as exc:
                 print(f"Scheduled scan deferred: {exc}", flush=True)
+            except Exception as exc:  # keep the daemon alive
+                print(f"Scheduled scan failed: {exc}", flush=True)
         delay = (
             900
             if after_target

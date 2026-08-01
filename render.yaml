@@ -1,0 +1,72 @@
+# Render blueprint for Playbook.
+#
+# The web service owns the persistent SQLite disk. Render cron jobs cannot
+# mount disks, so the nightly scan is triggered over HTTP and executes inside
+# the web service, where the price cache and scan history already live.
+#
+# Deploy: push this repo to GitHub, then New → Blueprint on render.com.
+
+services:
+  - type: web
+    name: playbook
+    runtime: python
+    plan: starter          # 512 MB / 0.5 CPU. Use "standard" for faster scans.
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --config gunicorn.conf.py app:app
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    disk:
+      name: playbook-data
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - key: PLAYBOOK_DATA_CACHE
+        value: /var/data/playbook.sqlite3
+      - key: PLAYBOOK_UNIVERSE
+        value: nasdaq
+      - key: PLAYBOOK_SCAN_WORKERS
+        value: "4"
+      - key: PLAYBOOK_SCAN_TIME
+        value: "17:15"
+      # The in-process scheduler is the primary automation. The cron job below
+      # is a belt-and-braces retry in case the web service restarted late.
+      - key: PLAYBOOK_ENABLE_SCHEDULER
+        value: "1"
+      - key: PLAYBOOK_SCAN_TOKEN
+        generateValue: true
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: GUNICORN_THREADS
+        value: "8"
+      - key: GUNICORN_TIMEOUT
+        value: "180"
+
+  - type: cron
+    name: playbook-nightly-trigger
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    # 22:30 UTC ≈ 17:30 America/New_York during daylight saving, 18:30 EST.
+    # The scanner itself refuses to run before the close is confirmed, so an
+    # early or late trigger is safe.
+    schedule: "30 22 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python trigger_scan.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - key: PLAYBOOK_SCAN_URL
+        fromService:
+          type: web
+          name: playbook
+          property: hostport
+      - key: PLAYBOOK_SCAN_TOKEN
+        fromService:
+          type: web
+          name: playbook
+          envVarKey: PLAYBOOK_SCAN_TOKEN
