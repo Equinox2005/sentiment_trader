@@ -1,95 +1,83 @@
-````markdown
-# Sentiment Trader
+# Playbook
 
-Live and historical sentiment-driven trading signals from Reddit comments.
+**What happened the last 20 times this stock looked exactly like today?**
 
-## Features
+Playbook is a no-login research website for everyday traders. Type any stock, ETF, index, or crypto symbol and it scans up to **ten years of price history** for the days that most resemble today's setup — same momentum, same trend position, same volatility, same fear level — then shows you exactly what happened next. No jargon, no wall of numbers. Just a verdict, a plan, and the receipts.
 
-- Backfill: Fetches the most recent comments from your chosen subreddits.
-- Real-time stream: Continues listening for new comments as they appear.
-- Keyword tracking: Monitors comments matching your custom keywords (e.g. “Tesla”, “NVIDIA”).
-- Sentiment analysis: Base sentiment from VADER (or your choice) plus tweaks for “bearish”, “bullish”, “red”, “green”.
-- Live price lookup: Fetches the latest ticker price via Yahoo Finance.
-- Per-ticker averages: Displays running average sentiment per symbol.
-- Subreddit info: Shows which subreddit each comment came from.
-- GUI: Simple PySimpleGUI desktop interface.
+## Why it's different
 
-## 📦 Installation
+Most free tools show you *indicators* and leave the interpretation to you. Playbook answers the actual question a trader has:
 
-1. **Clone the repo**
+> "Based on real history, is this more likely to go up or down from here — and what should I do about it?"
 
-   ```bash
-   git clone https://github.com/Equinox2005/sentiment_trader.git
-   cd sentiment_trader
-````
+- **One plain-English verdict** — "History leans UP", "History leans DOWN", or "History is split" — with a signal-strength gauge and a one-sentence explanation anyone can understand.
+- **Ghost paths** — the chart projects faint lines showing what price *actually did* after each similar past setup, plus a shaded "likely range" cone. You literally see the possible futures history suggests.
+- **A concrete trade plan** — entry, take-profit, stop-loss, reward-to-risk, and time horizon, all derived from where past look-alike setups actually topped and bottomed. Type an amount and it tells you your exact dollar upside and downside.
+- **The receipts** — every match is a real, dated, verifiable moment in that asset's history with its real 1-week / 2-week / 1-month outcomes. Nothing is a black box.
+- **A news reality-check** — today's headlines are scored with an explainable finance lexicon and tested against the historical verdict: *confirms*, *conflicts*, or *neutral*.
+- **Honest by design** — when history shows no edge, Playbook says so and tells you to wait. When there isn't enough data, it refuses to guess.
 
-2. **Create & activate a virtual environment**
+## Run locally
 
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
+Requires Python 3.10+.
 
-3. **Install dependencies**
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## 🔧 Configuration
-
-Create a `.env` file in the project root:
-
-```ini
-REDDIT_CLIENT_ID=your_reddit_app_client_id
-REDDIT_CLIENT_SECRET=your_reddit_app_client_secret
-REDDIT_USER_AGENT=YourAppName/0.1 by u/YourRedditUsername
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python app.py
 ```
 
-## 🚀 Usage
+Open [http://localhost:8000](http://localhost:8000). Market data comes from Yahoo Finance via `yfinance` — no API keys needed.
 
-```bash
-python app_gui.py
+## Test
+
+```powershell
+python -m unittest discover -s tests -v
 ```
 
-1. **Enter** a comma-separated list of keywords (e.g. `Tesla, NVIDIA, AMD`).
-2. **For each keyword**, enter its ticker symbol (include `$`, e.g. `$TSLA`).
-3. The app backfills the last 24 hours of comments, then opens the GUI:
+The suite runs on deterministic synthetic data with no network access.
 
-   * **Message pane** shows each comment + sentiment, subreddit, time, price.
-   * **Summary** shows total comments and overall average sentiment.
-   * **Per-ticker box** shows average sentiment per ticker.
+## API
 
-## 🗂 File Structure
-
-```
-sentiment-trader/
-├── app_gui.py         # main PySimpleGUI application
-├── stream.py          # Reddit streaming logic
-├── sentiment.py       # VADER (or keyword) sentiment functions
-├── aggregator.py      # time-bucket aggregation
-├── signals.py         # buy/sell signal logic
-├── config.py          # loads your .env variables
-├── requirements.txt
-├── .env               # your Reddit credentials (not committed)
-├── .gitignore
-└── README.md
+```text
+GET /api/health
+GET /api/analyze/NVDA
+GET /api/analyze/BTC-USD?refresh=1
 ```
 
-## Dependencies
+The analysis payload contains the quote, the playbook (verdict, odds, trade plan, ghost paths, dated matches), the news check, scored headlines, and chart history. Results are cached in memory for five minutes; `?refresh=1` bypasses the cache.
 
-* [PySimpleGUI](https://pypi.org/project/PySimpleGUI/)
-* [PRAW](https://praw.readthedocs.io/)
-* [yfinance](https://pypi.org/project/yfinance/)
-* [python-dotenv](https://pypi.org/project/python-dotenv/)
-* [pandas](https://pypi.org/project/pandas/)
-* [nltk](https://pypi.org/project/nltk/)
-* [requests](https://pypi.org/project/requests/)
-* [matplotlib](https://pypi.org/project/matplotlib/) *(if using chart features)*
-* [numpy](https://pypi.org/project/numpy/)
-* [transformers](https://pypi.org/project/transformers/) & [torch](https://pypi.org/project/torch/) *(optional)*
+## Docker
 
-
-
+```powershell
+docker build -t playbook .
+docker run --rm -p 8000:8000 playbook
 ```
+
+## How the engine works
+
+1. **Fingerprint today.** Six features describe the current setup: 1-month and 1-week momentum, RSI (14), distance from the 50-day trend, 21-day realized volatility, and drawdown from the one-year high.
+2. **Scan history.** Every qualifying past day (up to ten years) gets the same fingerprint. Days are ranked by normalized distance to today; matches must be at least two months apart so they represent independent episodes, and recent days can't match themselves.
+3. **Measure what followed.** For up to 20 best matches, the engine records the real 5-, 10-, and 21-day forward returns.
+4. **Verdict and plan.** Win rate and median outcome set the direction; the stop goes where the weakest quarter of past setups bottomed, the target where the strongest quarter peaked.
+5. **News check.** Recent headlines are sentiment-scored and compared against the verdict.
+
+### What it can't do
+
+Playbook sees patterns, not the future. It doesn't know about tomorrow's earnings, Fed meetings, or black-swan events, and past performance never guarantees future results. It is a research tool, not financial advice — the user always makes the call, which is why every brief ships with a stop-loss.
+
+## Project structure
+
+```text
+.
+├── app.py            # Flask app and API routes
+├── playbook.py       # Historical analog engine (the core product)
+├── market_data.py    # Yahoo provider, caching, news check, payload assembly
+├── sentiment.py      # Explainable financial-language scoring
+├── static/           # Frontend logic and styles
+├── templates/        # Single-page UI
+├── tests/            # 22 deterministic unit/API tests
+├── Dockerfile
+└── requirements.txt
 ```

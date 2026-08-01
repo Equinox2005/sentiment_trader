@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Playbook shows what happened the last 20 times a stock looked exactly like it does today — and turns it into a plain-English trade plan.">
+  <title>Playbook — What happened last time?</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">⟲</span>
+      <span>Playbook</span>
+    </a>
+    <div class="header-actions">
+      <span class="tagline">History doesn't repeat, but it rhymes.</span>
+      <button class="icon-button" id="themeToggle" type="button" aria-label="Switch color theme">◐</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero" id="hero">
+      <h1>What happened the <em>last 20 times</em> this stock looked like today?</h1>
+      <p class="hero-lede">
+        Type any stock or crypto. Playbook scans up to <strong>10 years of history</strong> for the days that
+        looked most like right now — same momentum, same trend, same fear level — and shows you exactly
+        what happened next. No jargon. Just a verdict, a plan, and the receipts.
+      </p>
+
+      <form class="symbol-search" id="symbolForm" role="search">
+        <label class="sr-only" for="symbolInput">Stock or crypto symbol</label>
+        <input id="symbolInput" autocomplete="off" spellcheck="false" maxlength="12" placeholder="Type a symbol — like NVDA or BTC-USD">
+        <button type="submit">Show me</button>
+      </form>
+      <div class="quick-picks">
+        <span>Popular:</span>
+        <button type="button" data-symbol="NVDA">NVDA</button>
+        <button type="button" data-symbol="AAPL">AAPL</button>
+        <button type="button" data-symbol="TSLA">TSLA</button>
+        <button type="button" data-symbol="SPY">SPY</button>
+        <button type="button" data-symbol="BTC-USD">Bitcoin</button>
+      </div>
+    </section>
+
+    <p class="status-message" id="statusMessage" role="status" aria-live="polite"></p>
+    <div class="loading-strip" id="loadingStrip" hidden>
+      <div class="loading-bar"></div>
+      <p id="loadingText">Scanning ten years of history…</p>
+    </div>
+
+    <section class="workspace" id="workspace" hidden>
+
+      <!-- ============ VERDICT ============ -->
+      <div class="verdict-card" id="verdictCard">
+        <div class="verdict-top">
+          <div class="asset-line">
+            <span class="asset-symbol" id="assetSymbol">—</span>
+            <span class="asset-name" id="assetName">—</span>
+          </div>
+          <div class="asset-price-line">
+            <strong id="assetPrice">—</strong>
+            <span class="change-pill" id="dailyChange">—</span>
+            <button class="watch-button" id="watchButton" type="button" aria-pressed="false">☆ Watch</button>
+          </div>
+        </div>
+
+        <div class="verdict-main">
+          <div class="verdict-headline-block">
+            <span class="verdict-arrow" id="verdictArrow">→</span>
+            <div>
+              <h2 id="verdictHeadline">Analyzing…</h2>
+              <p id="verdictExplanation" class="verdict-explanation"></p>
+            </div>
+          </div>
+          <div class="verdict-gauge">
+            <div class="gauge-track"><div class="gauge-fill" id="gaugeFill"></div></div>
+            <div class="gauge-labels"><span>Weak signal</span><span id="confidenceLabel">—</span><span>Strong signal</span></div>
+          </div>
+        </div>
+
+        <p class="setup-line" id="setupLine"></p>
+        <div class="story-check" id="storyCheck" hidden>
+          <span class="story-icon" id="storyIcon">📰</span>
+          <p id="storySummary"></p>
+        </div>
+      </div>
+
+      <!-- ============ CHART + GHOSTS ============ -->
+      <div class="panel chart-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>The next month, according to history</h3>
+            <p class="panel-sub">Faint lines show what price actually did after each similar setup in the past. The shaded cone is the likely range.</p>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <svg id="mainChart" viewBox="0 0 900 360" preserveAspectRatio="none" role="img" aria-label="Price history with historical projections"></svg>
+          <div class="chart-tooltip" id="chartTooltip" hidden><span></span><strong></strong></div>
+        </div>
+        <div class="chart-legend" id="chartLegend">
+          <span><i class="swatch swatch-price"></i> Actual price</span>
+          <span><i class="swatch swatch-ghost"></i> Past look-alike paths</span>
+          <span><i class="swatch swatch-cone"></i> Likely range</span>
+          <span><i class="swatch swatch-target"></i> Target</span>
+          <span><i class="swatch swatch-stop"></i> Stop-loss</span>
+        </div>
+      </div>
+
+      <div class="two-column">
+        <!-- ============ TRADE PLAN ============ -->
+        <div class="panel plan-panel">
+          <div class="panel-heading">
+            <div>
+              <h3 id="planTitle">Your trade plan</h3>
+              <p class="panel-sub" id="planNote"></p>
+            </div>
+          </div>
+          <div class="plan-rows" id="planRows"></div>
+          <div class="plan-sizer" id="planSizer">
+            <label>If I invest
+              <span class="input-shell"><i>$</i><input id="investAmount" type="number" min="10" step="50" value="1000"></span>
+            </label>
+            <div class="sizer-results" id="sizerResults"></div>
+          </div>
+        </div>
+
+        <!-- ============ ODDS ============ -->
+        <div class="panel odds-panel">
+          <div class="panel-heading">
+            <div>
+              <h3>The odds, from real history</h3>
+              <p class="panel-sub" id="oddsSub">Based on the most similar past setups.</p>
+            </div>
+          </div>
+          <div class="odds-visual" id="oddsVisual"></div>
+          <div class="odds-stats" id="oddsStats"></div>
+        </div>
+      </div>
+
+      <!-- ============ RECEIPTS ============ -->
+      <div class="panel receipts-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>The receipts</h3>
+            <p class="panel-sub">Every match is a real date you can verify. This is what actually happened after each one.</p>
+          </div>
+          <button class="toggle-receipts" id="toggleReceipts" type="button">Show all matches</button>
+        </div>
+        <div class="receipts-table-wrap">
+          <table class="receipts-table">
+            <thead>
+              <tr><th>Date it looked like today</th><th>Match</th><th>1 week later</th><th>2 weeks later</th><th>1 month later</th></tr>
+            </thead>
+            <tbody id="receiptsBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="two-column">
+        <!-- ============ NEWS ============ -->
+        <div class="panel news-panel">
+          <div class="panel-heading">
+            <div>
+              <h3>Today's headlines</h3>
+              <p class="panel-sub" id="newsSub"></p>
+            </div>
+          </div>
+          <div class="news-list" id="newsList"></div>
+        </div>
+
+        <!-- ============ WATCHLIST ============ -->
+        <div class="panel watchlist-panel">
+          <div class="panel-heading">
+            <div>
+              <h3>Your watchlist</h3>
+              <p class="panel-sub">Saved in your browser only.</p>
+            </div>
+          </div>
+          <div class="watchlist" id="watchlist"></div>
+          <p class="empty-note" id="watchlistEmpty">Star a symbol to keep it here.</p>
+        </div>
+      </div>
+
+      <details class="methodology">
+        <summary>How Playbook works — and what it can't do</summary>
+        <div id="methodologyText"></div>
+      </details>
+    </section>
+  </main>
+
+  <footer>
+    <p><strong>Playbook</strong> shows historical patterns, not the future. Past performance never guarantees future results. This is a research tool, not financial advice — you are always the one making the call.</p>
+  </footer>
+</body>
+</html>
