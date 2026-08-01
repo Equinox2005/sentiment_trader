@@ -18,7 +18,26 @@ def make_history(periods=900, wave=True):
         base = 100 + step * 0.12
         ripple = 8 * math.sin(step / 17) + 4 * math.sin(step / 5) if wave else 0
         closes.append(base + ripple)
-    return pd.DataFrame({"Close": closes}, index=index)
+    close = pd.Series(closes, index=index)
+    open_price = close * (
+        1 + pd.Series(
+            [0.002 * math.sin(step / 4) for step in range(periods)],
+            index=index,
+        )
+    )
+    return pd.DataFrame(
+        {
+            "Open": open_price,
+            "High": pd.concat([open_price, close], axis=1).max(axis=1) * 1.006,
+            "Low": pd.concat([open_price, close], axis=1).min(axis=1) * 0.994,
+            "Close": close,
+            "Volume": [
+                1_000_000 + 100_000 * math.sin(step / 9)
+                for step in range(periods)
+            ],
+        },
+        index=index,
+    )
 
 
 class FakeProvider:
@@ -53,6 +72,19 @@ class FakeProvider:
             },
         ]
         return history, profile, news, []
+
+    def market_context(self):
+        history = make_history()
+        return pd.DataFrame(
+            {
+                "Market": history["Close"] * 4,
+                "VIX": [
+                    18 + 4 * math.sin(step / 20)
+                    for step in range(len(history))
+                ],
+            },
+            index=history.index,
+        )
 
 
 class StaleNewsProvider(FakeProvider):
@@ -89,6 +121,13 @@ class MarketIntelligenceTests(unittest.TestCase):
             {"bullish", "bearish", "neutral"},
         )
         self.assertIn("action", result["playbook"]["trade_plan"])
+        self.assertIn("probability_up", result["playbook"]["forecast"])
+        self.assertIn("validation", result["playbook"])
+        self.assertIn("Market trend", result["playbook"]["matching"]["features_used"])
+        self.assertGreater(
+            result["playbook"]["forecast"]["news_adjustment_points"],
+            0,
+        )
         self.assertIn(result["story"]["state"], {"confirms", "conflicts", "neutral"})
         self.assertLessEqual(len(result["history"]), 190)
         self.assertEqual(result["news"][0]["sentiment_label"], "Positive")

@@ -34,12 +34,18 @@ def normalize_symbol(value):
 
 
 class YahooFinanceProvider:
+    def __init__(self, context_cache_seconds=3600):
+        self.context_cache_seconds = context_cache_seconds
+        self._context_cache = None
+        self._context_cached_at = 0.0
+        self._context_lock = threading.Lock()
+
     def _ticker(self, symbol):
         return yf.Ticker(symbol)
 
     def history(self, ticker):
         try:
-            history = ticker.history(period="10y", interval="1d", auto_adjust=True)
+            history = ticker.history(period="max", interval="1d", auto_adjust=True)
         except Exception as exc:
             raise MarketDataError("The market data provider could not be reached.") from exc
         if history is None or history.empty or "Close" not in history:
@@ -47,6 +53,42 @@ class YahooFinanceProvider:
                 "No recent price history was found for that symbol."
             )
         return history
+
+    def market_context(self):
+        with self._context_lock:
+            if (
+                self._context_cache is not None
+                and time.monotonic() - self._context_cached_at
+                < self.context_cache_seconds
+            ):
+                return self._context_cache.copy()
+            try:
+                raw = yf.download(
+                    ["SPY", "^VIX"],
+                    period="max",
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True,
+                )
+                close = raw["Close"]
+                context = pd.DataFrame(
+                    {
+                        "Market": pd.to_numeric(close["SPY"], errors="coerce"),
+                        "VIX": pd.to_numeric(close["^VIX"], errors="coerce"),
+                    }
+                ).dropna(how="all")
+            except Exception as exc:
+                raise MarketDataError(
+                    "Broad-market context is temporarily unavailable."
+                ) from exc
+            if context.empty:
+                raise MarketDataError(
+                    "Broad-market context is temporarily unavailable."
+                )
+            self._context_cache = context
+            self._context_cached_at = time.monotonic()
+            return context.copy()
 
     def profile(self, ticker):
         try:
@@ -133,12 +175,20 @@ class MarketIntelligenceService:
                 "No recent headlines were available, so the brief relies on price action."
             )
 
+        context = None
+        if hasattr(self.provider, "market_context"):
+            try:
+                context = self.provider.market_context()
+            except MarketDataError as exc:
+                warnings.append(str(exc))
+
         result = _build_analysis(
             symbol=symbol,
             history=history,
             profile=profile,
             news=normalized_news,
             warnings=warnings,
+            context=context,
         )
         self._store_cached(symbol, result)
         return copy.deepcopy(result)
@@ -173,7 +223,7 @@ class MarketIntelligenceService:
             self._cache[symbol] = (now, copy.deepcopy(value))
 
 
-def _build_analysis(symbol, history, profile, news, warnings):
+def _build_analysis(symbol, history, profile, news, warnings, context=None):
     close = pd.to_numeric(history["Close"], errors="coerce").dropna()
     if len(close) < 2:
         raise MarketDataError("Not enough price history exists to analyze this symbol.")
@@ -181,12 +231,18 @@ def _build_analysis(symbol, history, profile, news, warnings):
     current = float(close.iloc[-1])
     previous = float(close.iloc[-2])
     daily_change = _percent_change(current, previous)
-    month_change = _period_return(close, 21)
+    month_change = _period_return(close, _month_period(close))
     year_high = float(close.tail(252).max())
     year_low = float(close.tail(252).min())
 
-    play = build_playbook(close)
     narrative_score = _weighted_news_score(news)
+    play = build_playbook(
+        history,
+        context=context,
+        news_score=narrative_score,
+        news_count=len(news),
+        earnings_at=_profile_earnings_at(profile),
+    )
     story = _build_story_check(play, narrative_score, len(news))
 
     chart_close = close.tail(190)
@@ -229,13 +285,15 @@ def _build_analysis(symbol, history, profile, news, warnings):
             "neutral": sum(abs(item["sentiment"]) < 0.18 for item in news),
         },
         "history": chart,
-        "history_years": round(len(close) / 252, 1),
+        "history_years": _history_years(close),
         "warnings": warnings,
         "methodology": (
-            "Playbook fingerprints today's setup (momentum, trend, volatility, RSI, "
-            "drawdown), finds the most similar days in up to ten years of history, "
-            "and reports the real outcomes that followed. The news check then tests "
-            "whether today's headlines agree with that historical pattern."
+            "Playbook compares today's OHLCV fingerprint and one-month chart shape with "
+            "independent episodes in up to twenty years of history. It selects an "
+            "explainable weight profile on older walk-forward checkpoints, evaluates "
+            "that profile on newer untouched checkpoints, and weights the real paths "
+            "that followed. Recent news can adjust the displayed probability by at "
+            "most five points; it cannot manufacture or reverse an analog edge."
         ),
     }
 
@@ -265,27 +323,28 @@ def _build_story_check(play, narrative_score, news_count):
             ),
         }
 
-    direction = play["verdict"]["direction"]
+    direction = play["forecast"]["analog_direction"]
+    adjustment = play["forecast"]["news_adjustment_points"]
     agreement = {
         ("bullish", "positive"): (
             "confirms",
-            "Today's headlines are positive AND history says similar setups "
-            "usually rose. Story and statistics agree — this strengthens the signal.",
+            f"Positive headlines add {adjustment:+.1f} points to the displayed "
+            "up-probability. The historical edge remains the primary evidence.",
         ),
         ("bearish", "negative"): (
             "confirms",
-            "Today's headlines are negative AND history says similar setups "
-            "usually fell. Story and statistics agree — this strengthens the signal.",
+            f"Negative headlines add {adjustment:+.1f} points to the displayed "
+            "up-probability. The historical edge remains the primary evidence.",
         ),
         ("bullish", "negative"): (
             "conflicts",
-            "History leans up, but today's news is negative. Fresh bad news can "
-            "break an old pattern — treat the bullish signal with extra caution.",
+            f"Negative headlines subtract {abs(adjustment):.1f} points from the "
+            "historical up-probability. They can cancel, but never reverse, the analog edge.",
         ),
         ("bearish", "positive"): (
             "conflicts",
-            "History leans down, but today's news is positive. Fresh good news can "
-            "break an old pattern — the bearish signal is weaker than it looks.",
+            f"Positive headlines add {adjustment:+.1f} points against the bearish "
+            "historical edge. They can cancel, but never reverse, that edge.",
         ),
     }
     state, summary = agreement.get(
@@ -297,6 +356,18 @@ def _build_story_check(play, narrative_score, news_count):
         ),
     )
     return {"state": state, "news_lean": news_lean, "summary": summary}
+
+
+def _profile_earnings_at(profile):
+    for key in (
+        "earningsTimestampStart",
+        "earningsTimestamp",
+        "earningsTimestampEnd",
+    ):
+        parsed = _parse_datetime(profile.get(key))
+        if parsed:
+            return parsed
+    return None
 
 
 def _normalize_news_item(item):
@@ -387,6 +458,23 @@ def _is_recent(value, max_age_days):
 def _period_return(close, periods):
     start = float(close.iloc[-min(periods + 1, len(close))])
     return _percent_change(float(close.iloc[-1]), start)
+
+
+def _history_years(close):
+    if len(close) < 2:
+        return 0.0
+    try:
+        elapsed = (pd.Timestamp(close.index[-1]) - pd.Timestamp(close.index[0])).days
+        return round(min(20.0, max(0.0, elapsed / 365.25)), 1)
+    except (TypeError, ValueError):
+        return round(min(20.0, len(close) / 252), 1)
+
+
+def _month_period(close):
+    if isinstance(close.index, pd.DatetimeIndex) and len(close) >= 60:
+        if float((close.index.dayofweek >= 5).mean()) >= 0.15:
+            return 30
+    return 21
 
 
 def _percent_change(current, previous):

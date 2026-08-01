@@ -1,21 +1,68 @@
 # Playbook
 
-**What happened the last 20 times this stock looked exactly like today?**
+**Find today's closest historical market twins. See every future that followed.**
 
-Playbook is a no-login research website for everyday traders. Type any stock, ETF, index, or crypto symbol and it scans up to **ten years of price history** for the days that most resemble today's setup — same momentum, same trend position, same volatility, same fear level — then shows you exactly what happened next. No jargon, no wall of numbers. Just a verdict, a plan, and the receipts.
+Playbook is a no-login historical-analog forecasting website for stocks, ETFs, indices, and crypto. It converts the complete current setup into a market fingerprint, searches up to 20 years for independent look-alike episodes, replays their next month, and shows whether this exact matching method worked at untouched historical checkpoints.
 
-## Why it's different
+It does not hide uncertainty behind a single indicator or an unexplained confidence number. Every forecast exposes:
 
-Most free tools show you *indicators* and leave the interpretation to you. Playbook answers the actual question a trader has:
+- today's fingerprint;
+- every dated historical match;
+- the paths and outcome distribution that produced the estimate;
+- the asset's normal up-rate, which the analogs must beat;
+- an uncertainty range based on effective independent evidence;
+- walk-forward performance against a simple baseline;
+- any small adjustment made by current headlines.
 
-> "Based on real history, is this more likely to go up or down from here — and what should I do about it?"
+## What the fingerprint contains
 
-- **One plain-English verdict** — "History leans UP", "History leans DOWN", or "History is split" — with a signal-strength gauge and a one-sentence explanation anyone can understand.
-- **Ghost paths** — the chart projects faint lines showing what price *actually did* after each similar past setup, plus a shaded "likely range" cone. You literally see the possible futures history suggests.
-- **A concrete trade plan** — entry, take-profit, stop-loss, reward-to-risk, and time horizon, all derived from where past look-alike setups actually topped and bottomed. Type an amount and it tells you your exact dollar upside and downside.
-- **The receipts** — every match is a real, dated, verifiable moment in that asset's history with its real 1-week / 2-week / 1-month outcomes. Nothing is a black box.
-- **A news reality-check** — today's headlines are scored with an explainable finance lexicon and tested against the historical verdict: *confirms*, *conflicts*, or *neutral*.
-- **Honest by design** — when history shows no edge, Playbook says so and tells you to wait. When there isn't enough data, it refuses to guess.
+The engine uses adjusted OHLCV data and, when available, aligned SPY/VIX context:
+
+- 1-month and 3-month momentum;
+- correctly handled Wilder-style RSI;
+- short-, medium-, and long-term trend structure;
+- current volatility and volatility expansion/contraction;
+- drawdown from the trailing one-year high;
+- ATR and five-day candlestick pressure;
+- five-day versus twenty-day volume;
+- prior-session SPY momentum/trend and trailing VIX percentile;
+- the normalized geometry of the complete trailing one-month price path.
+
+Missing optional inputs are excluded consistently from both live matching and historical validation. Broad-market context is lagged by one US session so an earlier-closing global market never receives a US close that had not happened yet.
+
+## How matching works
+
+1. **Fingerprint today.** Every feature is trailing/as-of; future data is never used to describe a historical day.
+2. **Scale robustly.** Candidate history determines each feature's median and median absolute deviation. Extreme values are clipped so one crisis observation cannot dominate the distance.
+3. **Select the weighting model.** Balanced, price-structure, regime, and participation profiles compete on older walk-forward checkpoints. The lowest-Brier profile wins.
+4. **Protect the audit.** Newer checkpoints remain untouched until the chosen profile is evaluated.
+5. **Find independent twins.** Weighted feature distance and one-month chart-shape distance rank past dates. Up to 30 matches are selected. Exchange-traded assets use 21-session shapes and 42-session episode spacing; seven-day markets use 30-calendar-day shapes and 60-day spacing. The recent exclusion window prevents a candidate's forward path from overlapping today's fingerprint.
+6. **Weight the evidence.** Closer matches contribute more through a stable kernel whose bandwidth targets a healthy effective sample size. Evidence is capped by the number of calendar years represented.
+7. **Beat the base rate.** The probability is shrunk toward the asset's own as-of historical up-rate. A bullish or bearish verdict requires an edge over that rate plus a compatible median return—not merely a result above or below 50%.
+
+The **match score** is a distance score from 1–99. It is not a probability.
+
+## Forecasts, news, and risk
+
+The headline horizon is one market month: 21 trading sessions for exchange-traded assets and 30 calendar days for seven-day markets such as crypto. Momentum, volatility annualization, trend windows, shape matching, spacing, projections, and validation all use that same detected sampling calendar. Playbook reports the similarity-weighted 20th percentile, median, and 80th percentile returns plus a Bayesian evidence interval for the chance of finishing higher.
+
+Recent headline sentiment can move the displayed probability by at most five percentage points. News can strengthen, weaken, or cancel an analog edge, but it cannot create one or reverse its direction. Historical article sentiment is not used in matching because the free data source does not provide a reliable historical news archive.
+
+Stops and targets come from each matched path's actual intramonth adverse and favorable excursion—not its month-end return. The plan simulates which level was touched first and includes unresolved paths at their final return. If those paths do not support positive expectancy and defensible reward/risk, Playbook refuses to manufacture a trade.
+
+Known upcoming earnings within seven days are shown as catalyst risk rather than pretended to be an ordinary analog feature.
+
+## Walk-forward reliability
+
+For each historical checkpoint, Playbook:
+
+1. uses only information available on that date;
+2. builds scaling parameters from earlier candidate history;
+3. excludes candidates whose future outcome was not yet known;
+4. runs the same matcher used for today's forecast;
+5. compares its probability with the realized 21-day direction.
+
+The UI reports directional accuracy with a 95% Wilson interval, Brier score, stronger-edge coverage, and the accuracy of simply choosing the asset's normal direction. A small or weak validation sample is labeled accordingly; it is not presented as proven accuracy.
 
 ## Run locally
 
@@ -28,7 +75,7 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-Open [http://localhost:8000](http://localhost:8000). Market data comes from Yahoo Finance via `yfinance` — no API keys needed.
+Open [http://localhost:8000](http://localhost:8000). Yahoo Finance supplies market data; no API key is required.
 
 ## Test
 
@@ -36,7 +83,7 @@ Open [http://localhost:8000](http://localhost:8000). Market data comes from Yaho
 python -m unittest discover -s tests -v
 ```
 
-The suite runs on deterministic synthetic data with no network access.
+The 30-test suite covers the richer fingerprint, corrected RSI edge case, independent episode spacing, bounded news adjustment, post-entry intraday path outcomes, extreme base rates, global session-date alignment, crypto calendar windows, base-rate shrinkage, walk-forward reporting, service caching, API errors, and sentiment behavior.
 
 ## API
 
@@ -46,7 +93,7 @@ GET /api/analyze/NVDA
 GET /api/analyze/BTC-USD?refresh=1
 ```
 
-The analysis payload contains the quote, the playbook (verdict, odds, trade plan, ghost paths, dated matches), the news check, scored headlines, and chart history. Results are cached in memory for five minutes; `?refresh=1` bypasses the cache.
+Responses are cached in memory for five minutes. `?refresh=1` bypasses the cache.
 
 ## Docker
 
@@ -55,29 +102,6 @@ docker build -t playbook .
 docker run --rm -p 8000:8000 playbook
 ```
 
-## How the engine works
+## Important limitation
 
-1. **Fingerprint today.** Six features describe the current setup: 1-month and 1-week momentum, RSI (14), distance from the 50-day trend, 21-day realized volatility, and drawdown from the one-year high.
-2. **Scan history.** Every qualifying past day (up to ten years) gets the same fingerprint. Days are ranked by normalized distance to today; matches must be at least two months apart so they represent independent episodes, and recent days can't match themselves.
-3. **Measure what followed.** For up to 20 best matches, the engine records the real 5-, 10-, and 21-day forward returns.
-4. **Verdict and plan.** Win rate and median outcome set the direction; the stop goes where the weakest quarter of past setups bottomed, the target where the strongest quarter peaked.
-5. **News check.** Recent headlines are sentiment-scored and compared against the verdict.
-
-### What it can't do
-
-Playbook sees patterns, not the future. It doesn't know about tomorrow's earnings, Fed meetings, or black-swan events, and past performance never guarantees future results. It is a research tool, not financial advice — the user always makes the call, which is why every brief ships with a stop-loss.
-
-## Project structure
-
-```text
-.
-├── app.py            # Flask app and API routes
-├── playbook.py       # Historical analog engine (the core product)
-├── market_data.py    # Yahoo provider, caching, news check, payload assembly
-├── sentiment.py      # Explainable financial-language scoring
-├── static/           # Frontend logic and styles
-├── templates/        # Single-page UI
-├── tests/            # 22 deterministic unit/API tests
-├── Dockerfile
-└── requirements.txt
-```
+Historical analogs estimate a distribution; they do not know the future. Earnings surprises, policy decisions, liquidity shocks, changing businesses, and unprecedented events can invalidate every match. Walk-forward results are symbol-specific and based on a limited number of independent checkpoints. Playbook is a research instrument, not financial advice or a profitability guarantee.
