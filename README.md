@@ -143,11 +143,25 @@ Run it after **5:15 PM America/New_York**. The scanner confirms the latest SPY s
 | `nasdaq` *(default)* | ~3,500–4,000 |
 | `us` | ~5,500–6,500 |
 
-Each `(market session, algorithm version)` batch is immutable. SQLite stores the exact universe snapshot, per-symbol state, side, raw ranking factors, failures, runtime, and a bounded cross-process lease. If a run is interrupted, rerunning after the lease expires resumes unfinished symbols without recomputing completed ones, and a second process cannot steal an active lease. Individual provider failures produce an explicit partial board rather than aborting the batch.
+Each `(market session, algorithm version)` batch is immutable. SQLite stores the exact universe snapshot, per-symbol state, side, raw ranking factors, failures, runtime, and a bounded cross-process lease. If a run is interrupted, rerunning after the lease expires resumes unfinished symbols without recomputing completed ones, and a second process cannot steal an active lease. New symbol attempts are globally paced across workers. Transient market-data failures receive a three-attempt exponential-backoff budget with jitter; exhausted failures produce an explicit partial board and visible unavailable count rather than an empty board that looks like “no signals.” Detailed scan history is retained for 30 runs by default, and SQLite reuses the freed pages without an expensive nightly `VACUUM`.
 
 A name reaches a board when its analogs lean clearly in one direction, the untouched audit ran, the typical move is at least 1.5%, the share price is at least $2, and risk has not cancelled the edge. Audit grade, evidence, agreement, and news conflict then decide **which tier** it lands in rather than silently hiding it — that is what makes the board return dozens of ranked names instead of a handful.
 
-Tune with `PLAYBOOK_SCAN_WORKERS` (maximum 16), `PLAYBOOK_UNIVERSE`, `PLAYBOOK_MAX_SYMBOLS`, `PLAYBOOK_SCAN_TIME`, and `PLAYBOOK_DATA_CACHE`. With four workers and a warm price cache, a ~3,800-symbol scan takes roughly two to five hours depending on provider latency and CPU; the first cold run is slower because every symbol downloads twenty years of history.
+Tune with `PLAYBOOK_SCAN_WORKERS` (maximum 16), `PLAYBOOK_UNIVERSE`, `PLAYBOOK_MAX_SYMBOLS`, `PLAYBOOK_SCAN_TIME`, and `PLAYBOOK_DATA_CACHE`. Rate-limit controls are `PLAYBOOK_SCAN_REQUEST_INTERVAL` (default `0.4` seconds), `PLAYBOOK_SCAN_RETRY_ATTEMPTS` (default `3`), `PLAYBOOK_SCAN_RETRY_BASE_SECONDS` (default `2`), `PLAYBOOK_SCAN_RETRY_MAX_SECONDS` (default `30`), and `PLAYBOOK_SCAN_RETRY_JITTER_SECONDS` (default `1`). `PLAYBOOK_SCAN_RETENTION_RUNS` defaults to `30`.
+
+Measured on the development machine against 40 real S&P 500 symbols on 2026-08-01:
+
+| Workers | Wall time | Seconds/symbol | 3,800-symbol extrapolation |
+| ---: | ---: | ---: | ---: |
+| 3 | 183.2 s | 4.58 s | 4.83 h |
+| 4 | 123.5 s | 3.09 s | 3.26 h |
+| 8 | 158.4 s | 3.96 s | 4.18 h |
+
+The cold and warm four-worker runs were both about 2.4 minutes before hardening; caching avoids the historical download but the full walk-forward audit and optional Yahoo calls dominate. Eight workers were slower from oversubscription and peaked at 313.5 MB RSS. The isolated low-cache four-worker scanner peaked at 231.5 MB. These figures are honest local extrapolations, not a guarantee for Yahoo or Render; sustained-run results and provider failures are written to the scan log and database.
+
+A sustained four-worker benchmark then scanned 200 S&P 500 symbols under algorithm version `benchmark-hardened-200-20260801`. It was deliberately stopped at 107/200 and resumed only after its 15-minute lease expired. The resumed process finished the remaining 93 symbols in about 4m 49s; all 107 earlier completion timestamps remained unchanged, proving they were not recomputed. Combined active scan time was about 11m 4s, or 3.32 seconds per symbol, which extrapolates to roughly 3.5 hours for 3,800 symbols on this machine. The final board had 199 analyses, no exhausted provider failures, and one explicit skip (`FDXF`, insufficient history). The scanner peaked at 273 MB RSS while the concurrently responsive development web process had peaked at 104 MB.
+
+The completed sample stored 1,729,202 adjusted bars across 202 cached symbols in a 203.5 MiB database with only 48 KiB free, or about 1.01 MiB of active database space per cached symbol. The file grew 87.3 MiB while the resumed benchmark added 89 newly cached symbols. At the final density, 3,800 symbols require roughly 4.0 GB and 6,000 require roughly 6.3 GB before WAL and operational headroom. A 10 GB disk is appropriate for the Nasdaq scope; use at least 20 GB for the full U.S. scope. Monitor Render’s Disk Usage graph and increase the disk before it reaches 80%. Disk sizes can be increased but not reduced.
 
 ## Automatic daily updates
 
@@ -171,14 +185,48 @@ python trigger_scan.py     # reads PLAYBOOK_SCAN_URL and PLAYBOOK_SCAN_TOKEN
 
 `render.yaml` is a ready blueprint. Push the repo to GitHub, then choose **New → Blueprint** on Render.
 
-It provisions a web service on a 10 GB persistent disk mounted at `/var/data`, points `PLAYBOOK_DATA_CACHE` at it, generates a `PLAYBOOK_SCAN_TOKEN`, enables the in-process scheduler, and adds a weekday cron job at 22:30 UTC that calls `trigger_scan.py` as a backstop.
+It provisions a Standard web service on a 10 GB persistent disk mounted at `/var/data`, points `PLAYBOOK_DATA_CACHE` at it, generates a `PLAYBOOK_SCAN_TOKEN`, enables the in-process scheduler, and adds a weekday cron job at 22:30 UTC that calls `trigger_scan.py` as a backstop. The schedule is 18:30 EDT in summer and 17:30 EST in winter, safely after the close and the 17:15 scan gate year-round.
 
 Two constraints shaped this layout:
 
-- Render cron jobs cannot mount disks, so the scan must execute inside the web service rather than in the cron container. The cron job only sends the trigger.
+- Render cron jobs cannot mount disks, so the scan must execute inside the web service rather than in the cron container. The cron job only sends an authenticated HTTP trigger over Render’s private network.
 - SQLite wants one writer, so `gunicorn.conf.py` defaults to a single worker with eight threads. Scaling horizontally would require moving storage to Postgres first.
 
-The `starter` plan (0.5 CPU) completes a full Nasdaq scan overnight. `standard` roughly halves it. On a free instance that sleeps, rely on the GitHub Actions workflow, which pings `/api/health` before triggering.
+The 512 MB Starter plan is not recommended: the sustained scanner and responsive development web process reached about 377 MB of combined process peaks before operating-system and production-server headroom, and the eight-worker test reached 313.5 MB for the scanner alone. `render.yaml` therefore uses Standard (1 CPU, 2 GB RAM). At current published prices, the realistic baseline is about **$28.50/month** on a Hobby workspace: $25 Standard web service + $2.50 for 10 GB of persistent disk + Render’s $1 minimum cron charge, before excess bandwidth. The cheaper Starter configuration is about $10.50/month but has insufficient safety margin and materially less CPU.
+
+Deployment checklist:
+
+1. Push `main` to a GitHub repository. Never add `.env`, `instance/`, or any `*.sqlite3` file; `.gitignore` already excludes all three.
+2. In Render, choose **New → Blueprint**, connect the repository, select `render.yaml`, and apply the two services.
+3. Wait for the `playbook` web service health check to pass. `PLAYBOOK_SCAN_TOKEN` is generated by Render; copy it only to a password manager and the two GitHub repository secrets described below.
+4. Confirm **Disks** shows `playbook-data` mounted at `/var/data`, and **Environment** shows `PLAYBOOK_DATA_CACHE=/var/data/playbook.sqlite3`.
+5. Visit `/api/health`, `/`, and `/api/opportunities/status`. Trigger one scan from the cron service’s **Runs → Trigger Run** control or with the authenticated `curl` command below.
+6. After the first completed scan, note the board counts, choose **Manual Deploy → Deploy latest commit** on the web service, and confirm the same session and counts remain. That proves the SQLite file is on the persistent disk rather than the ephemeral source filesystem.
+
+Environment variables:
+
+- `PLAYBOOK_DATA_CACHE`: absolute SQLite path on the mounted disk.
+- `PLAYBOOK_UNIVERSE`: `nasdaq`, `sp500`, or `us`.
+- `PLAYBOOK_SCAN_WORKERS`: simultaneous audited symbol analyses; four is the measured default.
+- `PLAYBOOK_SCAN_TIME`: earliest same-day scan time in America/New_York.
+- `PLAYBOOK_ENABLE_SCHEDULER`: enables the in-process weekday scheduler when set to `1`.
+- `PLAYBOOK_SCAN_TOKEN`: generated 256-bit trigger secret; never commit or expose it in a URL.
+- `PLAYBOOK_SCAN_*RETRY*` and `PLAYBOOK_SCAN_REQUEST_INTERVAL`: Yahoo pacing and retry budget described above.
+- `PLAYBOOK_SCAN_RETENTION_RUNS`: number of detailed immutable board runs retained.
+- `WEB_CONCURRENCY=1`: preserves SQLite’s single-process ownership model.
+- `GUNICORN_THREADS`: concurrent HTTP request capacity inside that worker.
+
+For GitHub Actions, add repository secrets named `PLAYBOOK_SCAN_URL` (the public `https://…onrender.com` origin) and `PLAYBOOK_SCAN_TOKEN` (the generated Render value). The Render cron uses the private `hostport` reference with `PLAYBOOK_SCAN_SCHEME=http`; public GitHub triggers default to HTTPS.
+
+Manual production verification:
+
+```bash
+curl https://<app>/api/health
+curl -X POST -H "X-Playbook-Scan-Token: $PLAYBOOK_SCAN_TOKEN" https://<app>/api/opportunities/run
+curl https://<app>/api/opportunities/status
+```
+
+The first trigger should return `202`; a second while it is running should return `409`. The status endpoint should show the active persisted run and advance its processed count while `/` and `/api/health` remain responsive.
 
 ## Test
 
@@ -186,7 +234,7 @@ The `starter` plan (0.5 CPU) completes a full Nasdaq scan overnight. `standard` 
 python -m unittest discover -s tests -v
 ```
 
-The suite covers two-sided ranking and tiering, Nasdaq/NYSE directory parsing and derivative filtering, universe merging and fallback, per-side ranking, board side filters, the single-symbol signal endpoint, scan-trigger authorization, vectorized shape equivalence, batch/single matching equivalence, persistent refresh and split drift, cross-worker snapshot coherence, immutable forecast grading, completed-session boundaries, dense leak-free audit records, separated conformal calibration, multi-horizon distributions, waterfall arithmetic, Time Machine routes, corrected RSI edge cases, independent episode spacing, bounded news adjustment, intraday path outcomes, global session-date alignment, crypto calendars, base-rate shrinkage, API errors, sentiment behavior, universe validation/fallback, after-close gating, exact-session batch alignment, opportunity eligibility/ranking, claim-owner-safe resumable leases, immutable scans, partial failures, and board APIs. On the development machine, deterministic 20-year pure compute takes roughly 0.05 seconds for the preliminary forecast and 5 seconds for the complete 260-record audit.
+The suite covers two-sided ranking and tiering, Nasdaq/NYSE directory parsing and derivative filtering, universe merging and fallback, per-side ranking, board side filters, the single-symbol signal endpoint, scan-trigger authorization, request pacing, exponential retry exhaustion, partial-board warnings, scan-history retention, private Render trigger URLs, vectorized shape equivalence, batch/single matching equivalence, persistent refresh and split drift, cross-worker snapshot coherence, immutable forecast grading, completed-session boundaries, dense leak-free audit records, separated conformal calibration, multi-horizon distributions, waterfall arithmetic, Time Machine routes, corrected RSI edge cases, independent episode spacing, bounded news adjustment, intraday path outcomes, global session-date alignment, crypto calendars, base-rate shrinkage, API errors, sentiment behavior, universe validation/fallback, after-close gating, exact-session batch alignment, opportunity eligibility/ranking, claim-owner-safe resumable leases, immutable scans, partial failures, and board APIs. On the development machine, deterministic 20-year pure compute takes roughly 0.05 seconds for the preliminary forecast and 5 seconds for the complete 260-record audit.
 
 ## API
 
