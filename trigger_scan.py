@@ -12,13 +12,16 @@ import urllib.error
 import urllib.request
 
 
-def trigger(base_url, token, timeout=30):
+def trigger(base_url, token, timeout=30, scheme="https"):
     if not base_url:
         raise SystemExit("Set PLAYBOOK_SCAN_URL to the deployed service host.")
     if not token:
         raise SystemExit("Set PLAYBOOK_SCAN_TOKEN to the service's scan token.")
     if not base_url.startswith("http"):
-        base_url = f"https://{base_url}"
+        normalized_scheme = str(scheme).strip().lower()
+        if normalized_scheme not in {"http", "https"}:
+            raise SystemExit("PLAYBOOK_SCAN_SCHEME must be http or https.")
+        base_url = f"{normalized_scheme}://{base_url}"
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/opportunities/run",
         method="POST",
@@ -48,5 +51,6 @@ if __name__ == "__main__":
         trigger(
             os.getenv("PLAYBOOK_SCAN_URL", ""),
             os.getenv("PLAYBOOK_SCAN_TOKEN", ""),
+            scheme=os.getenv("PLAYBOOK_SCAN_SCHEME", "https"),
         )
     )
