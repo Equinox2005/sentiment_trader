@@ -459,6 +459,13 @@
 footer p { color: var(--faint); font-size: 12px; }
 
 @media (max-width: 620px) {
+  .header-actions { min-width: 0; gap: 8px; }
+  .scan-chip {
+    min-width: 0;
+    max-width: calc(100vw - 200px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .signal-head { grid-template-columns: 34px minmax(0, 1fr); }
   .signal-badge { grid-column: 1 / -1; align-items: flex-start; text-align: left; }
   .board-tabs { flex-direction: column; }

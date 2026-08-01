@@ -5,7 +5,7 @@ import threading
 import time
 from bisect import bisect_left
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
@@ -17,8 +17,14 @@ PRICE_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 class PlaybookStore:
     """Concurrency-safe persistent storage for prices and forecast records."""
 
-    def __init__(self, path):
+    def __init__(self, path, scan_retention_runs=None):
         self.path = os.path.abspath(path)
+        configured_retention = (
+            scan_retention_runs
+            if scan_retention_runs is not None
+            else os.getenv("PLAYBOOK_SCAN_RETENTION_RUNS", "30")
+        )
+        self.scan_retention_runs = max(1, int(configured_retention))
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._lock = threading.RLock()
         self._initialize()
@@ -250,7 +256,7 @@ class PlaybookStore:
         timestamp = _iso_utc(now)
         cutoff = _iso_utc(
             (now or datetime.now(timezone.utc))
-            - pd.Timedelta(seconds=ttl_seconds)
+            - timedelta(seconds=float(ttl_seconds))
         )
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -285,7 +291,7 @@ class PlaybookStore:
     def load_source_snapshot(self, snapshot_id, symbol, ttl_seconds=180):
         cutoff = _iso_utc(
             datetime.now(timezone.utc)
-            - pd.Timedelta(seconds=ttl_seconds)
+            - timedelta(seconds=float(ttl_seconds))
         )
         with self._lock, closing(self._connect()) as connection:
             row = connection.execute(
@@ -647,7 +653,7 @@ class PlaybookStore:
         current = _utc_datetime(now)
         timestamp = _iso_utc(current)
         lease_expires = _iso_utc(
-            current + pd.Timedelta(seconds=lease_seconds)
+            current + timedelta(seconds=float(lease_seconds))
         )
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -776,7 +782,7 @@ class PlaybookStore:
                 (
                     _iso_utc(current),
                     _iso_utc(
-                        current + pd.Timedelta(seconds=lease_seconds)
+                        current + timedelta(seconds=float(lease_seconds))
                     ),
                     int(run_id),
                     owner,
@@ -933,6 +939,16 @@ class PlaybookStore:
                 if counts["failed"] or counts["skipped"]
                 else "completed"
             )
+            final_warnings = list(warnings or [])
+            if counts["failed"]:
+                final_warnings.append(
+                    f"{counts['failed']} symbols remained unavailable after retries; "
+                    "the published board is partial."
+                )
+            if counts["skipped"]:
+                final_warnings.append(
+                    f"{counts['skipped']} symbols lacked enough clean history and were skipped."
+                )
             started = _parse_utc(run["started_at"])
             runtime = (
                 max(0.0, (current - started).total_seconds())
@@ -959,7 +975,7 @@ class PlaybookStore:
                     counts["completed"],
                     counts["failed"],
                     counts["skipped"],
-                    json.dumps(warnings or [], separators=(",", ":")),
+                    json.dumps(final_warnings, separators=(",", ":")),
                     timestamp,
                     timestamp,
                     runtime,
@@ -995,8 +1011,35 @@ class PlaybookStore:
                 """,
                 updates,
             )
+            self._prune_scan_history(connection)
             connection.commit()
         return self.get_scan_run(run_id, include_results=True)
+
+    def _prune_scan_history(self, connection):
+        """Bound detailed board history while allowing SQLite page reuse."""
+
+        connection.execute(
+            """
+            DELETE FROM scan_runs
+            WHERE id IN (
+                SELECT id
+                FROM scan_runs
+                ORDER BY session_date DESC, id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (self.scan_retention_runs,),
+        )
+        connection.execute(
+            """
+            DELETE FROM scan_universes
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM scan_runs
+                WHERE scan_runs.universe_id = scan_universes.id
+            )
+            """
+        )
 
     def fail_scan_run(self, run_id, owner, warning, now=None):
         timestamp = _iso_utc(now)

@@ -1,7 +1,6 @@
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
 
 import pandas as pd
 
@@ -14,6 +13,7 @@ from scanner import (
     SP500UniverseProvider,
     ScanGateError,
     UniverseError,
+    _RequestPacer,
     compact_scan_result,
     confirmed_scan_session,
     merge_universes,
@@ -498,6 +498,179 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(board["shorts"][0]["rank"], 1)
         self.assertEqual(board["short_count"], 1)
         self.assertEqual(board["eligible_count"], 3)
+
+    def test_transient_market_data_failure_retries_with_backoff(self):
+        delays = []
+
+        class Provider:
+            def _ticker(self, symbol):
+                return symbol
+
+            def history(self, symbol, ticker, force_refresh=False):
+                return spy_history(), []
+
+        class Service:
+            provider = Provider()
+            attempts = 0
+
+            def analyze(self, symbol, force_refresh=False, include_validation=True):
+                self.attempts += 1
+                if self.attempts < 3:
+                    raise MarketDataError("temporarily throttled")
+                return audited_analysis(symbol)
+
+        class Universe:
+            def load(inner_self, now=None):
+                items = [{"symbol": "AAA", "name": "A", "sector": "Tech"}]
+                return {
+                    "id": self.store.save_scan_universe(items, "test", now=now),
+                    "constituents": items,
+                    "warning": None,
+                }
+
+        service = Service()
+        result = OpportunityScanner(
+            service,
+            self.store,
+            universe_provider=Universe(),
+            workers=1,
+            retry_attempts=3,
+            retry_base_seconds=0.25,
+            retry_max_seconds=1,
+            sleep=delays.append,
+            random_uniform=lambda _start, _end: 0,
+        ).run_once(now=datetime(2025, 6, 10, 22, tzinfo=timezone.utc))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(service.attempts, 3)
+        self.assertEqual(delays, [0.25, 0.5])
+
+    def test_retry_exhaustion_is_visible_on_partial_board(self):
+        class Provider:
+            def _ticker(self, symbol):
+                return symbol
+
+            def history(self, symbol, ticker, force_refresh=False):
+                return spy_history(), []
+
+        class Service:
+            provider = Provider()
+
+            def analyze(self, symbol, force_refresh=False, include_validation=True):
+                raise MarketDataError("provider rate limited")
+
+        class Universe:
+            def load(inner_self, now=None):
+                items = [{"symbol": "BAD", "name": "B", "sector": "Tech"}]
+                return {
+                    "id": self.store.save_scan_universe(items, "test", now=now),
+                    "constituents": items,
+                    "warning": None,
+                }
+
+        result = OpportunityScanner(
+            Service(),
+            self.store,
+            universe_provider=Universe(),
+            workers=1,
+            retry_attempts=2,
+            sleep=lambda _delay: None,
+            random_uniform=lambda _start, _end: 0,
+        ).run_once(now=datetime(2025, 6, 10, 22, tzinfo=timezone.utc))
+        stored = self.store.get_scan_run(result["id"], include_results=True)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("board is partial", result["warnings"][-1])
+        self.assertIn("failed after 2 attempts", stored["results"][0]["error"])
+
+    def test_request_pacer_spaces_attempt_starts(self):
+        clock = [10.0]
+        delays = []
+
+        def sleep(delay):
+            delays.append(delay)
+            clock[0] += delay
+
+        pacer = _RequestPacer(0.5, sleep=sleep, monotonic=lambda: clock[0])
+        pacer.wait()
+        pacer.wait()
+        pacer.wait()
+
+        self.assertEqual(delays, [0.5, 0.5])
+
+    def test_broken_progress_stream_does_not_fail_completed_scan(self):
+        class Provider:
+            def _ticker(self, symbol):
+                return symbol
+
+            def history(self, symbol, ticker, force_refresh=False):
+                return spy_history(), []
+
+        class Service:
+            provider = Provider()
+
+            def analyze(self, symbol, force_refresh=False, include_validation=True):
+                return audited_analysis(symbol)
+
+        class Universe:
+            def load(inner_self, now=None):
+                items = [{"symbol": "AAA", "name": "A", "sector": "Tech"}]
+                return {
+                    "id": self.store.save_scan_universe(items, "test", now=now),
+                    "constituents": items,
+                    "warning": None,
+                }
+
+        def broken_progress(_message):
+            raise OSError(22, "Invalid argument")
+
+        result = OpportunityScanner(
+            Service(),
+            self.store,
+            universe_provider=Universe(),
+            workers=1,
+            progress_callback=broken_progress,
+            progress_every=1,
+        ).run_once(now=datetime(2025, 6, 10, 22, tzinfo=timezone.utc))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["completed_count"], 1)
+
+    def test_scan_history_retention_prunes_old_runs(self):
+        self.store.scan_retention_runs = 2
+        run_ids = []
+        for day in (8, 9, 10):
+            session = f"2025-06-{day:02d}"
+            items = [{"symbol": "AAA", "name": "A", "sector": "Tech"}]
+            universe_id = self.store.save_scan_universe(items, "test")
+            current = datetime(2025, 6, day, 22, tzinfo=timezone.utc)
+            run, acquired = self.store.acquire_scan_run(
+                session,
+                ALGORITHM_VERSION,
+                universe_id,
+                items,
+                f"owner-{day}",
+                now=current,
+            )
+            self.assertTrue(acquired)
+            self.store.claim_scan_symbol(
+                run["id"], "AAA", f"owner-{day}", now=current
+            )
+            self.store.save_scan_result(
+                run["id"],
+                "AAA",
+                "completed",
+                f"owner-{day}",
+                payload=compact_scan_result(audited_analysis("AAA")),
+                now=current,
+            )
+            self.store.finish_scan_run(run["id"], f"owner-{day}", now=current)
+            run_ids.append(run["id"])
+
+        self.assertIsNone(self.store.get_scan_run(run_ids[0]))
+        self.assertIsNotNone(self.store.get_scan_run(run_ids[1]))
+        self.assertIsNotNone(self.store.get_scan_run(run_ids[2]))
+        self.assertEqual(len(self.store.list_scan_runs(limit=10)), 2)
 
     def test_board_can_be_restricted_to_one_side(self):
         universe_id = self.store.save_scan_universe(

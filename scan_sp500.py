@@ -9,6 +9,11 @@ import os
 
 from market_data import MarketIntelligenceService, YahooFinanceProvider
 from scanner import (
+    DEFAULT_REQUEST_INTERVAL_SECONDS,
+    DEFAULT_RETRY_ATTEMPTS,
+    DEFAULT_RETRY_BASE_SECONDS,
+    DEFAULT_RETRY_JITTER_SECONDS,
+    DEFAULT_RETRY_MAX_SECONDS,
     DEFAULT_SCAN_TIME,
     DEFAULT_UNIVERSE_SCOPE,
     MarketUniverseProvider,
@@ -27,7 +32,13 @@ def build_scanner(args):
     )
     store = PlaybookStore(path)
     provider = YahooFinanceProvider(store=store)
-    service = MarketIntelligenceService(provider)
+    workers = max(1, min(16, int(args.workers)))
+    service = MarketIntelligenceService(
+        provider,
+        cache_seconds=0,
+        max_cache_entries=max(4, workers * 2),
+        source_cache_seconds=0,
+    )
     return OpportunityScanner(
         service,
         store,
@@ -36,8 +47,30 @@ def build_scanner(args):
             scope=args.universe,
             max_symbols=args.max_symbols,
         ),
-        workers=args.workers,
+        workers=workers,
         scan_time=args.scan_time,
+        request_interval_seconds=getattr(
+            args,
+            "request_interval",
+            DEFAULT_REQUEST_INTERVAL_SECONDS,
+        ),
+        retry_attempts=getattr(args, "retry_attempts", DEFAULT_RETRY_ATTEMPTS),
+        retry_base_seconds=getattr(
+            args,
+            "retry_base_seconds",
+            DEFAULT_RETRY_BASE_SECONDS,
+        ),
+        retry_max_seconds=getattr(
+            args,
+            "retry_max_seconds",
+            DEFAULT_RETRY_MAX_SECONDS,
+        ),
+        retry_jitter_seconds=getattr(
+            args,
+            "retry_jitter_seconds",
+            DEFAULT_RETRY_JITTER_SECONDS,
+        ),
+        progress_callback=lambda message: print(message, flush=True),
     )
 
 
@@ -77,6 +110,58 @@ def main(argv=None):
         "--scan-time",
         default=os.getenv("PLAYBOOK_SCAN_TIME", DEFAULT_SCAN_TIME),
         help="Earliest same-day scan time in America/New_York (default: 17:15).",
+    )
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=float(
+            os.getenv(
+                "PLAYBOOK_SCAN_REQUEST_INTERVAL",
+                str(DEFAULT_REQUEST_INTERVAL_SECONDS),
+            )
+        ),
+        help="Minimum seconds between new symbol attempts across all workers.",
+    )
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=int(
+            os.getenv("PLAYBOOK_SCAN_RETRY_ATTEMPTS", str(DEFAULT_RETRY_ATTEMPTS))
+        ),
+        help="Total attempts for transient market-data failures.",
+    )
+    parser.add_argument(
+        "--retry-base-seconds",
+        type=float,
+        default=float(
+            os.getenv(
+                "PLAYBOOK_SCAN_RETRY_BASE_SECONDS",
+                str(DEFAULT_RETRY_BASE_SECONDS),
+            )
+        ),
+        help="Initial exponential-backoff delay.",
+    )
+    parser.add_argument(
+        "--retry-max-seconds",
+        type=float,
+        default=float(
+            os.getenv(
+                "PLAYBOOK_SCAN_RETRY_MAX_SECONDS",
+                str(DEFAULT_RETRY_MAX_SECONDS),
+            )
+        ),
+        help="Maximum exponential-backoff delay.",
+    )
+    parser.add_argument(
+        "--retry-jitter-seconds",
+        type=float,
+        default=float(
+            os.getenv(
+                "PLAYBOOK_SCAN_RETRY_JITTER_SECONDS",
+                str(DEFAULT_RETRY_JITTER_SECONDS),
+            )
+        ),
+        help="Random jitter added to each retry delay.",
     )
     parser.add_argument(
         "--refresh",

@@ -1,9 +1,11 @@
 import html
 import math
 import os
+import random
 import re
 import socket
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as clock_time, timezone
@@ -24,6 +26,11 @@ MIN_UNIVERSE_SIZE = 450
 MIN_NASDAQ_UNIVERSE_SIZE = 1500
 DEFAULT_SCAN_TIME = "17:15"
 DEFAULT_UNIVERSE_SCOPE = "nasdaq"
+DEFAULT_REQUEST_INTERVAL_SECONDS = 0.4
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_BASE_SECONDS = 2.0
+DEFAULT_RETRY_MAX_SECONDS = 30.0
+DEFAULT_RETRY_JITTER_SECONDS = 1.0
 
 # Derivative share classes that are not ordinary tradable equity exposure.
 _NON_COMMON_NAME = re.compile(
@@ -47,6 +54,27 @@ class UniverseError(RuntimeError):
 
 class ScanGateError(RuntimeError):
     pass
+
+
+class _RequestPacer:
+    """Reserve globally spaced request starts across scanner workers."""
+
+    def __init__(self, interval_seconds, sleep=time.sleep, monotonic=time.monotonic):
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._next_start = 0.0
+
+    def wait(self):
+        if not self.interval_seconds:
+            return
+        with self._lock:
+            current = self._monotonic()
+            delay = max(0.0, self._next_start - current)
+            self._next_start = max(current, self._next_start) + self.interval_seconds
+        if delay:
+            self._sleep(delay)
 
 
 class _ConstituentTableParser(HTMLParser):
@@ -649,6 +677,15 @@ class OpportunityScanner:
         lease_seconds=900,
         scan_time=DEFAULT_SCAN_TIME,
         algorithm_version=ALGORITHM_VERSION,
+        request_interval_seconds=0,
+        retry_attempts=1,
+        retry_base_seconds=0,
+        retry_max_seconds=0,
+        retry_jitter_seconds=0,
+        sleep=time.sleep,
+        random_uniform=random.uniform,
+        progress_callback=None,
+        progress_every=25,
     ):
         self.service = service
         self.store = store
@@ -657,6 +694,18 @@ class OpportunityScanner:
         self.lease_seconds = max(60, int(lease_seconds))
         self.scan_time = scan_time
         self.algorithm_version = algorithm_version
+        self.retry_attempts = max(1, int(retry_attempts))
+        self.retry_base_seconds = max(0.0, float(retry_base_seconds))
+        self.retry_max_seconds = max(
+            self.retry_base_seconds,
+            float(retry_max_seconds),
+        )
+        self.retry_jitter_seconds = max(0.0, float(retry_jitter_seconds))
+        self._sleep = sleep
+        self._random_uniform = random_uniform
+        self._pacer = _RequestPacer(request_interval_seconds, sleep=sleep)
+        self.progress_callback = progress_callback
+        self.progress_every = max(1, int(progress_every))
 
     def run_once(self, now=None, force_refresh=False):
         current = _utc(now)
@@ -710,6 +759,12 @@ class OpportunityScanner:
         run_id = run["id"]
         try:
             pending = self.store.pending_scan_symbols(run_id)
+            processed = (
+                int(run.get("completed_count", 0))
+                + int(run.get("failed_count", 0))
+                + int(run.get("skipped_count", 0))
+            )
+            total = int(run.get("total_count", len(pending)))
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = {}
                 for item in pending:
@@ -731,7 +786,15 @@ class OpportunityScanner:
                     )
                     futures[future] = item["symbol"]
                 for future in as_completed(futures):
-                    future.result()
+                    outcome = future.result()
+                    processed += 1
+                    if self.progress_callback and (
+                        processed % self.progress_every == 0 or processed == total
+                    ):
+                        self._report_progress(
+                            f"Scan progress: {processed}/{total} processed; "
+                            f"latest {outcome['symbol']} {outcome['status']}."
+                        )
                     if not self.store.heartbeat_scan_run(
                         run_id,
                         owner,
@@ -756,6 +819,14 @@ class OpportunityScanner:
             )
             raise
 
+    def _report_progress(self, message):
+        """Keep a detached or broken console from invalidating scan work."""
+
+        try:
+            self.progress_callback(message)
+        except OSError:
+            self.progress_callback = None
+
     def _scan_symbol(
         self,
         run_id,
@@ -766,12 +837,56 @@ class OpportunityScanner:
         operation_now,
     ):
         symbol = item["symbol"]
+        for attempt in range(1, self.retry_attempts + 1):
+            self._pacer.wait()
+            try:
+                analysis = self.service.analyze(
+                    symbol,
+                    force_refresh=force_refresh,
+                    include_validation=True,
+                )
+                break
+            except MarketDataError as exc:
+                if attempt == self.retry_attempts:
+                    detail = str(exc)
+                    if self.retry_attempts > 1:
+                        detail = (
+                            f"{detail} (failed after {self.retry_attempts} attempts)"
+                        )
+                    self.store.save_scan_result(
+                        run_id,
+                        symbol,
+                        "failed",
+                        owner,
+                        error=detail,
+                        now=operation_now,
+                    )
+                    return {
+                        "symbol": symbol,
+                        "status": "failed",
+                        "attempts": attempt,
+                    }
+                backoff = min(
+                    self.retry_max_seconds,
+                    self.retry_base_seconds * (2 ** (attempt - 1)),
+                )
+                jitter = self._random_uniform(0, self.retry_jitter_seconds)
+                self._sleep(backoff + jitter)
+            except Exception as exc:
+                self.store.save_scan_result(
+                    run_id,
+                    symbol,
+                    "failed",
+                    owner,
+                    error=f"Unexpected analysis failure: {exc}",
+                    now=operation_now,
+                )
+                return {
+                    "symbol": symbol,
+                    "status": "failed",
+                    "attempts": attempt,
+                }
         try:
-            analysis = self.service.analyze(
-                symbol,
-                force_refresh=force_refresh,
-                include_validation=True,
-            )
             analysis_session = (
                 analysis.get("history", [{}])[-1].get("date")
                 if analysis.get("history")
@@ -795,6 +910,7 @@ class OpportunityScanner:
                 error=None if status == "completed" else payload.get("reason"),
                 now=operation_now,
             )
+            return {"symbol": symbol, "status": status, "attempts": attempt}
         except MarketDataError as exc:
             self.store.save_scan_result(
                 run_id,
@@ -804,6 +920,7 @@ class OpportunityScanner:
                 error=str(exc),
                 now=operation_now,
             )
+            return {"symbol": symbol, "status": "failed", "attempts": attempt}
         except Exception as exc:
             self.store.save_scan_result(
                 run_id,
@@ -813,6 +930,7 @@ class OpportunityScanner:
                 error=f"Unexpected analysis failure: {exc}",
                 now=operation_now,
             )
+            return {"symbol": symbol, "status": "failed", "attempts": attempt}
 
 
 BOARD_METHODOLOGY = (
@@ -967,15 +1085,49 @@ def _public_result(item):
 def build_default_scanner(store, service=None, workers=None, scan_time=None):
     """Create the scanner used by both the CLI and the hosted web process."""
 
+    worker_count = int(workers or os.getenv("PLAYBOOK_SCAN_WORKERS", "3"))
     if service is None:
         from market_data import MarketIntelligenceService, YahooFinanceProvider
 
-        service = MarketIntelligenceService(YahooFinanceProvider(store=store))
+        service = MarketIntelligenceService(
+            YahooFinanceProvider(store=store),
+            cache_seconds=0,
+            max_cache_entries=max(4, min(16, worker_count) * 2),
+            source_cache_seconds=0,
+        )
     return OpportunityScanner(
         service,
         store,
-        workers=int(workers or os.getenv("PLAYBOOK_SCAN_WORKERS", "3")),
+        workers=worker_count,
         scan_time=scan_time or os.getenv("PLAYBOOK_SCAN_TIME", DEFAULT_SCAN_TIME),
+        request_interval_seconds=float(
+            os.getenv(
+                "PLAYBOOK_SCAN_REQUEST_INTERVAL",
+                str(DEFAULT_REQUEST_INTERVAL_SECONDS),
+            )
+        ),
+        retry_attempts=int(
+            os.getenv("PLAYBOOK_SCAN_RETRY_ATTEMPTS", str(DEFAULT_RETRY_ATTEMPTS))
+        ),
+        retry_base_seconds=float(
+            os.getenv(
+                "PLAYBOOK_SCAN_RETRY_BASE_SECONDS",
+                str(DEFAULT_RETRY_BASE_SECONDS),
+            )
+        ),
+        retry_max_seconds=float(
+            os.getenv(
+                "PLAYBOOK_SCAN_RETRY_MAX_SECONDS",
+                str(DEFAULT_RETRY_MAX_SECONDS),
+            )
+        ),
+        retry_jitter_seconds=float(
+            os.getenv(
+                "PLAYBOOK_SCAN_RETRY_JITTER_SECONDS",
+                str(DEFAULT_RETRY_JITTER_SECONDS),
+            )
+        ),
+        progress_callback=lambda message: print(message, flush=True),
     )
 
 

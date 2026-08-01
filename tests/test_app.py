@@ -53,6 +53,7 @@ class StubBoard:
         return {
             "available": True,
             "run": {"session_date": "2025-06-10"},
+            "active_run": None,
             "long_count": len(longs),
             "short_count": len(shorts),
             "longs": longs if side in (None, "long") else [],
@@ -133,6 +134,13 @@ class AppTests(unittest.TestCase):
         self.assertIn(b"Buy signals", response.data)
         self.assertIn(b"Short signals", response.data)
         self.assertIn(b"Check any ticker", response.data)
+        self.assertIn(b"/static/favicon.svg", response.data)
+
+    def test_favicon_asset_is_available(self):
+        with self.client.get("/static/favicon.svg") as response:
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.mimetype, "image/svg+xml")
+
 
     def test_board_apis_expose_both_sides(self):
         page = self.client.get("/opportunities")
@@ -191,6 +199,31 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.get_json()["scan_running"])
+        self.assertIsNone(response.get_json()["active_run"])
+        self.assertEqual(
+            response.get_json()["latest_run"]["session_date"],
+            "2025-06-10",
+        )
+
+    def test_scan_status_reports_a_persisted_cross_process_run(self):
+        class ActiveBoard(StubBoard):
+            def latest(self, limit=50, side=None):
+                payload = super().latest(limit=limit, side=side)
+                payload["active_run"] = {
+                    "id": 2,
+                    "status": "running",
+                    "processed_count": 25,
+                    "total_count": 100,
+                }
+                return payload
+
+        app = create_app(StubService(), board_service=ActiveBoard())
+        app.config.update(TESTING=True, SCAN_TOKEN="")
+
+        payload = app.test_client().get("/api/opportunities/status").get_json()
+
+        self.assertTrue(payload["scan_running"])
+        self.assertEqual(payload["active_run"]["processed_count"], 25)
 
     def test_shareable_forecast_and_audit_pages_embed_route_state(self):
         forecast = self.client.get("/forecast/nvda")

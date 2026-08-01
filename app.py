@@ -27,17 +27,19 @@ _scan_lock = threading.Lock()
 _scan_state = {"running": False, "last_result": None, "last_error": None}
 
 
-def _run_scan_in_background(store, service):
+def _run_scan_in_background(store):
     """Run one full market scan without blocking the request thread."""
 
     with _scan_lock:
-        if _scan_state["running"]:
+        if _scan_state["running"] or store.active_scan_run() is not None:
             return False
         _scan_state["running"] = True
 
     def worker():
         try:
-            scanner = build_default_scanner(store, service)
+            # Keep the multi-hour scan's short-lived analysis cache separate
+            # from the interactive ticker checker.
+            scanner = build_default_scanner(store)
             result = scanner.run_once()
             _scan_state["last_result"] = {
                 "session_date": result.get("session_date"),
@@ -154,9 +156,14 @@ def create_app(service=None, board_service=None):
 
     @app.get("/api/opportunities/status")
     def opportunities_status():
+        board = app.extensions["opportunity_board"]
+        board_status = board.latest(limit=1) if board is not None else {}
+        active_run = board_status.get("active_run")
         response = jsonify(
             {
-                "scan_running": _scan_state["running"],
+                "scan_running": _scan_state["running"] or bool(active_run),
+                "active_run": active_run,
+                "latest_run": board_status.get("run"),
                 "last_result": _scan_state["last_result"],
                 "last_error": _scan_state["last_error"],
                 "trigger_enabled": bool(app.config["SCAN_TOKEN"]),
@@ -201,7 +208,7 @@ def create_app(service=None, board_service=None):
                 ),
                 503,
             )
-        started = _run_scan_in_background(store, app.extensions["market_service"])
+        started = _run_scan_in_background(store)
         return (
             jsonify(
                 {
@@ -209,7 +216,7 @@ def create_app(service=None, board_service=None):
                     "message": (
                         "The market scan is running in the background."
                         if started
-                        else "A scan is already running in this process."
+                        else "A scan is already running."
                     ),
                 }
             ),
@@ -407,10 +414,8 @@ def _start_embedded_scheduler(app):
     store = app.extensions.get("playbook_store")
     if store is None:
         return
-    service = app.extensions["market_service"]
-
     def worker():
-        scanner = build_default_scanner(store, service)
+        scanner = build_default_scanner(store)
         run_scheduler(scanner)
 
     threading.Thread(

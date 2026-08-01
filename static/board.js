@@ -6,6 +6,7 @@ const state = {
   data: null,
   pollTimer: null,
   checking: false,
+  expandedSymbols: new Set(),
 };
 
 const TIER_RANK = { strong: 3, moderate: 2, speculative: 1 };
@@ -210,9 +211,21 @@ function signalCard(item, index) {
   const actions = element("div", "signal-actions");
   const toggle = element("button", "detail-toggle", "Show details");
   toggle.type = "button";
+  const detailKey = `${item.side}:${item.symbol}`;
+  if (state.expandedSymbols.has(detailKey)) {
+    details.classList.add("is-open");
+    toggle.textContent = "Hide details";
+  }
+  toggle.setAttribute(
+    "aria-expanded",
+    String(details.classList.contains("is-open")),
+  );
   toggle.addEventListener("click", () => {
     const open = details.classList.toggle("is-open");
     toggle.textContent = open ? "Hide details" : "Show details";
+    toggle.setAttribute("aria-expanded", String(open));
+    if (open) state.expandedSymbols.add(detailKey);
+    else state.expandedSymbols.delete(detailKey);
   });
   const link = element("a", "signal-link", "Full historical analysis →");
   link.href = `/forecast/${encodeURIComponent(item.symbol)}`;
