@@ -10,10 +10,11 @@ from market_data import (
     YahooFinanceProvider,
     normalize_symbol,
 )
+from scanner import OpportunityBoardService
 from storage import PlaybookStore
 
 
-def create_app(service=None):
+def create_app(service=None, board_service=None):
     app = Flask(__name__, instance_relative_config=True)
     app.config["JSON_SORT_KEYS"] = False
     if service is None:
@@ -28,6 +29,14 @@ def create_app(service=None):
         )
         app.extensions["playbook_store"] = store
     app.extensions["market_service"] = service
+    if board_service is None:
+        store = app.extensions.get("playbook_store") or getattr(
+            getattr(service, "provider", None),
+            "store",
+            None,
+        )
+        board_service = OpportunityBoardService(store) if store else None
+    app.extensions["opportunity_board"] = board_service
 
     @app.get("/")
     def index():
@@ -55,6 +64,41 @@ def create_app(service=None):
             initial_view="forecast",
             route_error="",
         )
+
+    @app.get("/opportunities")
+    def opportunities_page():
+        return render_template("opportunities.html")
+
+    @app.get("/api/opportunities/latest")
+    def opportunities_latest():
+        board = app.extensions["opportunity_board"]
+        if board is None:
+            return jsonify(
+                {
+                    "available": False,
+                    "message": "Persistent opportunity storage is not configured.",
+                    "opportunities": [],
+                }
+            )
+        limit = request.args.get("limit", "25")
+        try:
+            limit_value = max(1, min(100, int(limit)))
+        except ValueError:
+            return jsonify(
+                {"error": "Limit must be an integer.", "code": "invalid_limit"}
+            ), 400
+        response = jsonify(board.latest(limit=limit_value))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/api/opportunities/history")
+    def opportunities_history():
+        board = app.extensions["opportunity_board"]
+        if board is None:
+            return jsonify({"runs": []})
+        response = jsonify(board.history())
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/audit/<symbol>")
     def audit_page(symbol):

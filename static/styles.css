@@ -99,6 +99,13 @@ button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visibl
 
 .header-actions { display: flex; align-items: center; gap: 14px; }
 .tagline { color: var(--faint); font-size: 12px; font-style: italic; }
+.header-link {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+}
+.header-link:hover { color: var(--accent); }
 
 .icon-button {
   width: 36px; height: 36px;
@@ -1448,6 +1455,160 @@ body.has-analysis .landing-proof { display: none; }
 
 .empty-note { margin: 12px 0 0; color: var(--faint); font-size: 12.5px; }
 
+/* ============ AFTER-CLOSE OPPORTUNITIES ============ */
+.opportunity-page main { padding-bottom: 54px; }
+.opportunity-hero { max-width: 850px; padding: 64px 0 34px; }
+.opportunity-hero strong { color: var(--text); }
+.board-state {
+  display: inline-flex;
+  margin-top: 24px;
+  padding: 9px 13px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.scan-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.scan-overview > div {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.scan-overview span,
+.scan-overview strong { display: block; }
+.scan-overview span { color: var(--faint); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+.scan-overview strong { margin-top: 5px; font-size: 18px; letter-spacing: -0.03em; }
+.active-scan {
+  margin: 12px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  background: var(--accent-soft);
+}
+.active-scan > div:first-child { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.active-scan strong { font-size: 12px; }
+.active-scan span { color: var(--muted); font-size: 11px; }
+.opportunity-controls {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 24px;
+  margin: 34px 0 14px;
+}
+.opportunity-controls h2 { margin: 0; font-size: 22px; letter-spacing: -0.03em; }
+.opportunity-controls p { max-width: 720px; margin: 5px 0 0; color: var(--muted); font-size: 11.5px; }
+.opportunity-controls label { color: var(--faint); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.opportunity-controls select {
+  display: block;
+  margin-top: 5px;
+  padding: 8px 28px 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+.opportunity-list { display: grid; gap: 10px; }
+.opportunity-card {
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+}
+.opportunity-card:first-child {
+  border-color: var(--up);
+  background: linear-gradient(150deg, var(--up-soft), var(--surface) 45%);
+}
+.opportunity-heading { display: flex; align-items: center; gap: 14px; }
+.opportunity-rank {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 11px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 800;
+}
+.opportunity-heading h3 { margin: 0; font-size: 18px; }
+.opportunity-heading p { margin: 2px 0 0; color: var(--faint); font-size: 10.5px; }
+.opportunity-score { margin-left: auto; text-align: right; }
+.opportunity-score strong,
+.opportunity-score span { display: block; }
+.opportunity-score strong { color: var(--up); font-size: 22px; }
+.opportunity-score span { color: var(--faint); font-size: 8.5px; text-transform: uppercase; }
+.opportunity-thesis {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 17px;
+}
+.opportunity-thesis > div {
+  padding: 13px;
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.opportunity-thesis span,
+.opportunity-thesis strong,
+.opportunity-thesis small { display: block; }
+.opportunity-thesis span { color: var(--faint); font-size: 9px; text-transform: uppercase; }
+.opportunity-thesis strong { margin-top: 3px; font-size: 17px; }
+.opportunity-thesis > div:first-child strong { color: var(--up); }
+.opportunity-thesis small { margin-top: 2px; color: var(--muted); font-size: 9.5px; }
+.opportunity-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+.opportunity-metrics > div { padding: 9px; border: 1px solid var(--line); border-radius: 8px; }
+.opportunity-metrics span,
+.opportunity-metrics strong { display: block; }
+.opportunity-metrics span { color: var(--faint); font-size: 8.5px; }
+.opportunity-metrics strong { margin-top: 2px; font-size: 12px; }
+.opportunity-metrics strong.positive { color: var(--up); }
+.opportunity-metrics strong.negative { color: var(--down); }
+.opportunity-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.opportunity-footer p { margin: 0; color: var(--muted); font-size: 10.5px; }
+.opportunity-footer a { flex: 0 0 auto; color: var(--accent); font-size: 11px; font-weight: 750; text-decoration: none; }
+.empty-board {
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface);
+  color: var(--muted);
+  text-align: center;
+}
+.board-explainer {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 28px;
+}
+.board-explainer article { padding: 15px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); }
+.board-explainer span,
+.board-explainer strong { display: block; }
+.board-explainer span { color: var(--accent); font-size: 8.5px; font-weight: 800; text-transform: uppercase; }
+.board-explainer strong { margin-top: 6px; font-size: 13px; }
+.board-explainer p { margin: 5px 0 0; color: var(--faint); font-size: 10px; }
+
 /* ============ METHODOLOGY / FOOTER ============ */
 .methodology {
   border: 1px solid var(--line);
@@ -1485,6 +1646,8 @@ footer p { margin: 0; color: var(--faint); font-size: 12px; max-width: 720px; li
   .twin-signal-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .landing-proof { grid-template-columns: 1fr; }
   .tagline { display: none; }
+  .scan-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .opportunity-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
 @media (max-width: 560px) {
@@ -1512,6 +1675,13 @@ footer p { margin: 0; color: var(--faint); font-size: 12px; max-width: 720px; li
   .twin-contribution-heading { align-items: flex-start; flex-direction: column; }
   .time-machine-form > div { align-items: stretch; flex-direction: column; }
   .symbol-search { align-items: stretch; flex-direction: column; }
+  .opportunity-hero { padding-top: 38px; }
+  .opportunity-controls,
+  .opportunity-footer,
+  .active-scan > div:first-child { align-items: flex-start; flex-direction: column; }
+  .opportunity-thesis,
+  .board-explainer { grid-template-columns: 1fr; }
+  .opportunity-metrics { grid-template-columns: 1fr 1fr; }
   .symbol-search button,
   .time-machine-form button { min-height: 44px; }
 }

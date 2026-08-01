@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="The largest credible S&P 500 increases predicted by Playbook's complete after-close historical analog audit.">
+  <title>Tonight’s opportunities — Playbook</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script defer src="{{ url_for('static', filename='opportunities.js') }}"></script>
+</head>
+<body class="opportunity-page">
+  <header class="site-header">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">⟲</span>
+      <span>Playbook</span>
+    </a>
+    <div class="header-actions">
+      <a class="header-link" href="/">Analyze a symbol</a>
+      <button class="icon-button" id="themeToggle" type="button" aria-label="Switch color theme">◐</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="opportunity-hero">
+      <span class="eyebrow">After-close S&amp;P 500 opportunity board</span>
+      <h1>The largest <em>credible predicted increases</em> tonight.</h1>
+      <p class="hero-lede">
+        Every constituent receives Playbook’s complete historical-twin analysis.
+        Only bullish forecasts with a <strong>positive untouched audit</strong>
+        qualify. Downside and uncertainty reduce rank—they are never hidden.
+      </p>
+      <div class="board-state" id="boardState" role="status" aria-live="polite">
+        Loading the latest completed market scan…
+      </div>
+    </section>
+
+    <section class="scan-overview" id="scanOverview" hidden>
+      <div>
+        <span>Market session</span>
+        <strong id="scanSession">—</strong>
+      </div>
+      <div>
+        <span>Universe processed</span>
+        <strong id="scanCoverage">—</strong>
+      </div>
+      <div>
+        <span>Credible opportunities</span>
+        <strong id="credibleCount">—</strong>
+      </div>
+      <div>
+        <span>Full-scan runtime</span>
+        <strong id="scanRuntime">—</strong>
+      </div>
+    </section>
+
+    <section class="active-scan" id="activeScan" hidden>
+      <div>
+        <strong>A newer after-close scan is running</strong>
+        <span id="activeScanText"></span>
+      </div>
+      <div class="loading-track" aria-hidden="true">
+        <div class="loading-bar" id="activeScanBar"></div>
+      </div>
+    </section>
+
+    <section class="opportunity-controls" id="opportunityControls" hidden>
+      <div>
+        <h2>Ranked opportunities</h2>
+        <p id="boardMethodology"></p>
+      </div>
+      <label>
+        Show
+        <select id="resultLimit">
+          <option value="10">Top 10</option>
+          <option value="25" selected>Top 25</option>
+          <option value="50">Top 50</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="opportunity-list" id="opportunityList" aria-label="Ranked S&P 500 opportunities"></section>
+    <p class="empty-board" id="emptyBoard" hidden>
+      The scan completed, but no stock cleared every credibility guardrail.
+      That is a valid result—not a reason to lower the standard.
+    </p>
+
+    <section class="board-explainer">
+      <article>
+        <span>Eligibility</span>
+        <strong>Positive audit only</strong>
+        <p>Mixed, limited, weak, neutral, and conflicting forecasts stay out of the default board.</p>
+      </article>
+      <article>
+        <span>Reward</span>
+        <strong>Increase plus edge</strong>
+        <p>Projected median return and probability edge matter, but cannot qualify a stock alone.</p>
+      </article>
+      <article>
+        <span>Risk</span>
+        <strong>Downside is charged</strong>
+        <p>Wider ranges and larger 20th-percentile losses directly subtract from opportunity score.</p>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    <p><strong>Playbook</strong> ranks historical evidence, not guaranteed returns. Overnight news, earnings, liquidity, and unprecedented events can invalidate every analog.</p>
+  </footer>
+</body>
+</html>

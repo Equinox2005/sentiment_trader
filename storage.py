@@ -101,6 +101,71 @@ class PlaybookStore:
                 ON source_snapshots(symbol, created_at)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scan_universes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    source_timestamp TEXT,
+                    fetched_at TEXT NOT NULL,
+                    constituents_json TEXT NOT NULL,
+                    constituent_count INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scan_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_date TEXT NOT NULL,
+                    algorithm_version TEXT NOT NULL,
+                    universe_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    total_count INTEGER NOT NULL,
+                    completed_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    skipped_count INTEGER NOT NULL DEFAULT 0,
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    runtime_seconds REAL,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    FOREIGN KEY (universe_id) REFERENCES scan_universes(id),
+                    UNIQUE(session_date, algorithm_version)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scan_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    display_symbol TEXT NOT NULL,
+                    company_name TEXT NOT NULL,
+                    sector TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    claim_owner TEXT,
+                    eligible INTEGER NOT NULL DEFAULT 0,
+                    opportunity_score REAL,
+                    rank INTEGER,
+                    payload_json TEXT,
+                    error TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE,
+                    UNIQUE(run_id, symbol)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS scan_results_run_rank
+                ON scan_results(run_id, eligible, rank)
+                """
+            )
             columns = {
                 row["name"]
                 for row in connection.execute(
@@ -127,6 +192,16 @@ class PlaybookStore:
             if "outcome_date" not in forecast_columns:
                 connection.execute(
                     "ALTER TABLE forecasts ADD COLUMN outcome_date TEXT"
+                )
+            scan_result_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(scan_results)"
+                ).fetchall()
+            }
+            if "claim_owner" not in scan_result_columns:
+                connection.execute(
+                    "ALTER TABLE scan_results ADD COLUMN claim_owner TEXT"
                 )
             connection.commit()
 
@@ -495,6 +570,587 @@ class PlaybookStore:
             records.append(item)
         return records
 
+    def save_scan_universe(
+        self,
+        constituents,
+        source,
+        source_timestamp=None,
+        now=None,
+    ):
+        encoded = json.dumps(
+            constituents,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        timestamp = _iso_utc(now)
+        with self._lock, closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO scan_universes (
+                    source,
+                    source_timestamp,
+                    fetched_at,
+                    constituents_json,
+                    constituent_count
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    source,
+                    source_timestamp,
+                    timestamp,
+                    encoded,
+                    len(constituents),
+                ),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    def latest_scan_universe(self):
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    source,
+                    source_timestamp,
+                    fetched_at,
+                    constituents_json,
+                    constituent_count
+                FROM scan_universes
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["constituents"] = json.loads(
+            result.pop("constituents_json")
+        )
+        return result
+
+    def acquire_scan_run(
+        self,
+        session_date,
+        algorithm_version,
+        universe_id,
+        constituents,
+        owner,
+        lease_seconds=900,
+        now=None,
+    ):
+        current = _utc_datetime(now)
+        timestamp = _iso_utc(current)
+        lease_expires = _iso_utc(
+            current + pd.Timedelta(seconds=lease_seconds)
+        )
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT *
+                FROM scan_runs
+                WHERE session_date = ? AND algorithm_version = ?
+                """,
+                (session_date, algorithm_version),
+            ).fetchone()
+            if row is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO scan_runs (
+                        session_date,
+                        algorithm_version,
+                        universe_id,
+                        total_count,
+                        started_at,
+                        updated_at,
+                        lease_owner,
+                        lease_expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_date,
+                        algorithm_version,
+                        int(universe_id),
+                        len(constituents),
+                        timestamp,
+                        timestamp,
+                        owner,
+                        lease_expires,
+                    ),
+                )
+                run_id = int(cursor.lastrowid)
+                connection.executemany(
+                    """
+                    INSERT INTO scan_results (
+                        run_id,
+                        symbol,
+                        display_symbol,
+                        company_name,
+                        sector
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            run_id,
+                            item["symbol"],
+                            item.get("display_symbol", item["symbol"]),
+                            item.get("name", item["symbol"]),
+                            item.get("sector", ""),
+                        )
+                        for item in constituents
+                    ],
+                )
+                acquired = True
+            else:
+                run_id = int(row["id"])
+                if row["status"] in {"completed", "partial"}:
+                    connection.commit()
+                    return self._scan_run_from_row(row), False
+                existing_expiry = _parse_utc(row["lease_expires_at"])
+                lease_active = (
+                    existing_expiry is not None
+                    and existing_expiry > current
+                    and row["lease_owner"] != owner
+                )
+                if lease_active:
+                    connection.commit()
+                    return self._scan_run_from_row(row), False
+                reset_statuses = (
+                    ("running", "failed")
+                    if row["status"] == "failed"
+                    else ("running",)
+                )
+                placeholders = ",".join("?" for _ in reset_statuses)
+                connection.execute(
+                    f"""
+                    UPDATE scan_results
+                    SET status = 'pending',
+                        claim_owner = NULL,
+                        error = NULL,
+                        started_at = NULL,
+                        completed_at = NULL
+                    WHERE run_id = ? AND status IN ({placeholders})
+                    """,
+                    (run_id, *reset_statuses),
+                )
+                connection.execute(
+                    """
+                    UPDATE scan_runs
+                    SET status = 'running',
+                        updated_at = ?,
+                        completed_at = NULL,
+                        runtime_seconds = NULL,
+                        lease_owner = ?,
+                        lease_expires_at = ?
+                    WHERE id = ?
+                    """,
+                    (timestamp, owner, lease_expires, run_id),
+                )
+                acquired = True
+            connection.commit()
+        return self.get_scan_run(run_id), acquired
+
+    def heartbeat_scan_run(
+        self,
+        run_id,
+        owner,
+        lease_seconds=900,
+        now=None,
+    ):
+        current = _utc_datetime(now)
+        with self._lock, closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE scan_runs
+                SET updated_at = ?, lease_expires_at = ?
+                WHERE id = ?
+                  AND status = 'running'
+                  AND lease_owner = ?
+                """,
+                (
+                    _iso_utc(current),
+                    _iso_utc(
+                        current + pd.Timedelta(seconds=lease_seconds)
+                    ),
+                    int(run_id),
+                    owner,
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def pending_scan_symbols(self, run_id):
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT symbol, display_symbol, company_name, sector
+                FROM scan_results
+                WHERE run_id = ? AND status = 'pending'
+                ORDER BY symbol
+                """,
+                (int(run_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_scan_symbol(self, run_id, symbol, owner, now=None):
+        timestamp = _iso_utc(now)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                """
+                SELECT status, lease_owner, lease_expires_at
+                FROM scan_runs
+                WHERE id = ?
+                """,
+                (int(run_id),),
+            ).fetchone()
+            expiry = _parse_utc(run["lease_expires_at"]) if run else None
+            if (
+                run is None
+                or run["status"] != "running"
+                or run["lease_owner"] != owner
+                or expiry is None
+                or expiry <= _utc_datetime(now)
+            ):
+                connection.rollback()
+                return False
+            cursor = connection.execute(
+                """
+                UPDATE scan_results
+                SET status = 'running',
+                    claim_owner = ?,
+                    started_at = ?,
+                    error = NULL
+                WHERE run_id = ? AND symbol = ? AND status = 'pending'
+                """,
+                (owner, timestamp, int(run_id), symbol),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def save_scan_result(
+        self,
+        run_id,
+        symbol,
+        status,
+        owner,
+        payload=None,
+        error=None,
+        now=None,
+    ):
+        if status not in {"completed", "failed", "skipped"}:
+            raise ValueError("Invalid scan result status.")
+        encoded = (
+            json.dumps(payload, separators=(",", ":"), allow_nan=False)
+            if payload is not None
+            else None
+        )
+        eligible = bool(payload and payload.get("eligible"))
+        score = (
+            float(payload["opportunity_score"])
+            if payload and payload.get("opportunity_score") is not None
+            else None
+        )
+        timestamp = _iso_utc(now)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE scan_results
+                SET status = ?,
+                    claim_owner = NULL,
+                    eligible = ?,
+                    opportunity_score = ?,
+                    payload_json = ?,
+                    error = ?,
+                    completed_at = ?
+                WHERE run_id = ?
+                  AND symbol = ?
+                  AND status = 'running'
+                  AND claim_owner = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM scan_runs r
+                      WHERE r.id = scan_results.run_id
+                        AND r.status = 'running'
+                        AND r.lease_owner = ?
+                        AND r.lease_expires_at > ?
+                  )
+                """,
+                (
+                    status,
+                    int(eligible),
+                    score,
+                    encoded,
+                    error,
+                    timestamp,
+                    int(run_id),
+                    symbol,
+                    owner,
+                    owner,
+                    timestamp,
+                ),
+            )
+            if cursor.rowcount:
+                self._refresh_scan_counts(connection, run_id, timestamp)
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def finish_scan_run(self, run_id, owner, warnings=None, now=None):
+        current = _utc_datetime(now)
+        timestamp = _iso_utc(current)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                """
+                SELECT *
+                FROM scan_runs
+                WHERE id = ? AND lease_owner = ?
+                """,
+                (int(run_id), owner),
+            ).fetchone()
+            if not run:
+                connection.rollback()
+                return None
+            counts = self._scan_counts(connection, run_id)
+            unfinished = counts["pending"] + counts["running"]
+            if unfinished:
+                connection.rollback()
+                raise RuntimeError(
+                    f"Cannot finish a scan with {unfinished} unfinished symbols."
+                )
+            final_status = (
+                "partial"
+                if counts["failed"] or counts["skipped"]
+                else "completed"
+            )
+            started = _parse_utc(run["started_at"])
+            runtime = (
+                max(0.0, (current - started).total_seconds())
+                if started is not None
+                else None
+            )
+            connection.execute(
+                """
+                UPDATE scan_runs
+                SET status = ?,
+                    completed_count = ?,
+                    failed_count = ?,
+                    skipped_count = ?,
+                    warnings_json = ?,
+                    updated_at = ?,
+                    completed_at = ?,
+                    runtime_seconds = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL
+                WHERE id = ?
+                """,
+                (
+                    final_status,
+                    counts["completed"],
+                    counts["failed"],
+                    counts["skipped"],
+                    json.dumps(warnings or [], separators=(",", ":")),
+                    timestamp,
+                    timestamp,
+                    runtime,
+                    int(run_id),
+                ),
+            )
+            ranked = connection.execute(
+                """
+                SELECT symbol
+                FROM scan_results
+                WHERE run_id = ? AND eligible = 1 AND status = 'completed'
+                ORDER BY opportunity_score DESC, symbol
+                """,
+                (int(run_id),),
+            ).fetchall()
+            connection.executemany(
+                """
+                UPDATE scan_results SET rank = ?
+                WHERE run_id = ? AND symbol = ?
+                """,
+                [
+                    (rank, int(run_id), row["symbol"])
+                    for rank, row in enumerate(ranked, start=1)
+                ],
+            )
+            connection.commit()
+        return self.get_scan_run(run_id, include_results=True)
+
+    def fail_scan_run(self, run_id, owner, warning, now=None):
+        timestamp = _iso_utc(now)
+        with self._lock, closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE scan_runs
+                SET status = 'failed',
+                    warnings_json = ?,
+                    updated_at = ?,
+                    completed_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL
+                WHERE id = ? AND lease_owner = ?
+                """,
+                (
+                    json.dumps([str(warning)], separators=(",", ":")),
+                    timestamp,
+                    timestamp,
+                    int(run_id),
+                    owner,
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def get_scan_run(self, run_id, include_results=False):
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT r.*, u.source AS universe_source,
+                       u.source_timestamp AS universe_source_timestamp,
+                       u.fetched_at AS universe_fetched_at
+                FROM scan_runs r
+                JOIN scan_universes u ON u.id = r.universe_id
+                WHERE r.id = ?
+                """,
+                (int(run_id),),
+            ).fetchone()
+            result_rows = (
+                connection.execute(
+                    """
+                    SELECT *
+                    FROM scan_results
+                    WHERE run_id = ?
+                    ORDER BY
+                        CASE WHEN rank IS NULL THEN 1 ELSE 0 END,
+                        rank,
+                        symbol
+                    """,
+                    (int(run_id),),
+                ).fetchall()
+                if row and include_results
+                else []
+            )
+        if not row:
+            return None
+        result = self._scan_run_from_row(row)
+        if include_results:
+            result["results"] = [
+                self._scan_result_from_row(item) for item in result_rows
+            ]
+        return result
+
+    def latest_completed_scan(self, include_results=True):
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT id
+                FROM scan_runs
+                WHERE status IN ('completed', 'partial')
+                ORDER BY session_date DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return (
+            self.get_scan_run(row["id"], include_results=include_results)
+            if row
+            else None
+        )
+
+    def active_scan_run(self, now=None):
+        cutoff = _iso_utc(now)
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT id
+                FROM scan_runs
+                WHERE status = 'running'
+                  AND lease_expires_at > ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (cutoff,),
+            ).fetchone()
+        return self.get_scan_run(row["id"]) if row else None
+
+    def list_scan_runs(self, limit=20):
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT id
+                FROM scan_runs
+                ORDER BY session_date DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, min(100, int(limit))),),
+            ).fetchall()
+        return [
+            self.get_scan_run(row["id"], include_results=False)
+            for row in rows
+        ]
+
+    @staticmethod
+    def _scan_run_from_row(row):
+        result = dict(row)
+        result["warnings"] = json.loads(
+            result.pop("warnings_json", "[]") or "[]"
+        )
+        return result
+
+    @staticmethod
+    def _scan_result_from_row(row):
+        result = dict(row)
+        payload = json.loads(result.pop("payload_json")) if result.get(
+            "payload_json"
+        ) else {}
+        result.update(payload)
+        result["eligible"] = bool(result["eligible"])
+        return result
+
+    @staticmethod
+    def _scan_counts(connection, run_id):
+        rows = connection.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM scan_results
+            WHERE run_id = ?
+            GROUP BY status
+            """,
+            (int(run_id),),
+        ).fetchall()
+        counts = {
+            "pending": 0,
+            "running": 0,
+            "completed": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+        counts.update({row["status"]: int(row["count"]) for row in rows})
+        return counts
+
+    def _refresh_scan_counts(self, connection, run_id, timestamp):
+        counts = self._scan_counts(connection, run_id)
+        connection.execute(
+            """
+            UPDATE scan_runs
+            SET completed_count = ?,
+                failed_count = ?,
+                skipped_count = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                counts["completed"],
+                counts["failed"],
+                counts["skipped"],
+                timestamp,
+                int(run_id),
+            ),
+        )
+
 
 def _price_rows_to_frame(rows):
     if not rows:
@@ -532,6 +1188,26 @@ def _iso_utc(value=None):
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _utc_datetime(value=None):
+    if value is None:
+        return datetime.now(timezone.utc)
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_utc(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return _utc_datetime(parsed)
 
 
 def _completed_session_date(session_date, timezone_name, now=None):
