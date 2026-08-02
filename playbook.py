@@ -27,6 +27,13 @@ MAX_NEWS_ADJUSTMENT = 5.0
 EVALUATION_STEP = 5
 MAX_EVALUATION_RECORDS = 260
 
+# Tradable entry convention. A signal formed from the completed close of
+# session t is filled at the open of session t + 1 and exited at the close of
+# session t + horizon. Analog outcomes, baseline rates, and walk-forward
+# targets all measure that same window, so the prediction that is audited is
+# the prediction that is displayed and later graded.
+ENTRY_SESSION_OFFSET = 1
+
 
 FEATURE_LABELS = {
     "r21": "1-month momentum",
@@ -101,6 +108,7 @@ class PreparedMatrices:
     feature_columns: dict
     feature_values: np.ndarray
     shapes: np.ndarray
+    open: np.ndarray
     close: np.ndarray
     high: np.ndarray
     low: np.ndarray
@@ -495,6 +503,24 @@ def _compute_shapes(close, shape_days=SHAPE_DAYS):
     return shapes
 
 
+def _entry_price_at(opens, closes, position):
+    """Price of the first session that a signal at ``position`` could reach.
+
+    A signal formed from the completed close of session ``t`` cannot be filled
+    at that close, so every forward return in this module is measured from the
+    open of session ``t + 1``. The close of that same session is used when an
+    open is missing so the entry still lands strictly after the signal bar.
+    """
+    entry_position = position + ENTRY_SESSION_OFFSET
+    if entry_position >= len(closes):
+        return None
+    for candidate in (opens[entry_position], closes[entry_position]):
+        value = float(candidate)
+        if np.isfinite(value) and value > 0:
+            return value
+    return None
+
+
 def _prepare_matrices(frame, features, shapes):
     names = tuple(features.columns)
     return PreparedMatrices(
@@ -504,6 +530,9 @@ def _prepare_matrices(frame, features, shapes):
             features.to_numpy(dtype=np.float64), dtype=np.float64
         ),
         shapes=np.ascontiguousarray(shapes, dtype=np.float64),
+        open=np.ascontiguousarray(
+            frame["Open"].to_numpy(dtype=np.float64)
+        ),
         close=np.ascontiguousarray(
             frame["Close"].to_numpy(dtype=np.float64)
         ),
@@ -792,9 +821,16 @@ def _historical_predictions(
         if len(matches) < MIN_MATCHES:
             continue
         summary = _summarize_matches(matches)
+        entry_price = _entry_price_at(
+            frame["Open"].to_numpy(dtype=float),
+            close.to_numpy(dtype=float),
+            target_position,
+        )
+        if entry_price is None:
+            continue
         actual_return = (
             float(close.iloc[target_position + config["horizon_days"]])
-            / float(close.iloc[target_position])
+            / entry_price
             - 1
         ) * 100
         predictions.append(
@@ -973,14 +1009,22 @@ def _strategy_audit(predictions, config, frame):
         periods[-1]["position"] + config["horizon_days"]
     )
     close = frame["Close"].to_numpy(dtype=float)
+    opens = frame["Open"].to_numpy(dtype=float)
     held = np.zeros(end_position - start_position + 1, dtype=bool)
+    # Offset -> fill price, so the first held session is marked from the open
+    # it was actually entered at rather than from the signal close.
+    entry_prices = {}
     trades = 0
     wins = 0
     for item in periods:
         if _historical_signal(item) != "bullish":
             continue
+        entry_price = _entry_price_at(opens, close, item["position"])
+        if entry_price is None:
+            continue
         trades += 1
         wins += item["actual_return"] > 0
+        entry_prices[item["position"] - start_position + 1] = entry_price
         interval_start = item["position"] - start_position + 1
         interval_end = (
             item["position"]
@@ -996,9 +1040,9 @@ def _strategy_audit(predictions, config, frame):
     hold_curve = [{"date": start_date, "value": 100.0}]
     for position in range(start_position + 1, end_position + 1):
         offset = position - start_position
-        daily_return = close[position] / close[position - 1] - 1
         if held[offset]:
-            strategy_equity *= 1 + daily_return
+            basis = entry_prices.get(offset, close[position - 1])
+            strategy_equity *= close[position] / basis
         hold_equity = close[position] / close[start_position] * 100
         date = _date_string(frame.index[position])
         strategy_curve.append(
@@ -1023,6 +1067,7 @@ def _strategy_audit(predictions, config, frame):
         "curve": _downsample_curve(strategy_curve),
         "hold_curve": _downsample_curve(hold_curve),
         "note": (
+            "Entered at the session open after each signal. "
             "Daily mark-to-market, non-overlapping long-or-cash signals versus "
             "continuous buy-and-hold; excludes fees, spreads, and taxes."
         ),
@@ -1200,13 +1245,17 @@ def _rank_matches(
     for position, distance in ranked:
         if any(abs(position - used) < config["spacing"] for used in used_positions):
             continue
-        selected.append(
+        record = (
             _match_record(
                 frame, features, position, distance, True, config
             )
             if include_paths
             else _match_record_fast(prepared, position, distance, config)
         )
+        if record is None:
+            # No usable fill exists on the session after this episode.
+            continue
+        selected.append(record)
         used_positions.append(position)
         if len(selected) == MAX_MATCHES:
             break
@@ -1273,6 +1322,8 @@ def _rank_matches(
                 )[:6]
             ]
     close = frame["Close"]
+    baseline_opens = frame["Open"].to_numpy(dtype=float)
+    baseline_closes = close.to_numpy(dtype=float)
     baseline_rates = {}
     for horizon in sorted({5, 10, config["horizon_days"]}):
         baseline_positions = range(
@@ -1280,11 +1331,15 @@ def _rank_matches(
             candidate_end + 1,
             horizon,
         )
-        baseline_outcomes = [
-            float(close.iloc[position + horizon])
-            > float(close.iloc[position])
+        baseline_entries = (
+            (position, _entry_price_at(baseline_opens, baseline_closes, position))
             for position in baseline_positions
             if position + horizon < target_position
+        )
+        baseline_outcomes = [
+            float(close.iloc[position + horizon]) > entry
+            for position, entry in baseline_entries
+            if entry is not None
         ]
         baseline_rates[horizon] = (
             (sum(baseline_outcomes) + 0.5)
@@ -1304,9 +1359,18 @@ def _match_record(
     config = config or _sampling_config(frame)
     horizon = config["horizon_days"]
     close = frame["Close"]
-    entry = float(close.iloc[position])
+    entry = _entry_price_at(
+        frame["Open"].to_numpy(dtype=float),
+        close.to_numpy(dtype=float),
+        position,
+    )
+    if entry is None:
+        return None
     future = close.iloc[position : position + horizon + 1]
     path = ((future / entry) - 1).to_numpy(dtype=float) * 100
+    # Index 0 is the signal bar, which sits before the fill; the entry itself
+    # is flat by construction.
+    path[0] = 0.0
     high_path = (
         (frame["High"].iloc[position : position + horizon + 1] / entry) - 1
     ).to_numpy(dtype=float) * 100
@@ -1333,9 +1397,12 @@ def _match_record(
 
 def _match_record_fast(prepared, position, distance, config):
     horizon = config["horizon_days"]
-    entry = prepared.close[position]
+    entry = _entry_price_at(prepared.open, prepared.close, position)
+    if entry is None:
+        return None
     future = prepared.close[position : position + horizon + 1]
     path = (future / entry - 1) * 100
+    path[0] = 0.0
     high_path = (
         prepared.high[position + 1 : position + horizon + 1] / entry - 1
     ) * 100

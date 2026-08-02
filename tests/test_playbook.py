@@ -10,8 +10,10 @@ from playbook import (
     _calendar_years,
     _conformal_diagnostics,
     _compute_features,
+    _entry_price_at,
     _first_touch,
     _match_record,
+    _match_record_fast,
     _normalize_history,
     _prepare_matrices,
     _rank_matches,
@@ -288,12 +290,66 @@ class PlaybookTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertTrue(1 <= result["forecast"]["probability_up"] <= 99)
 
+    def test_forward_returns_measure_the_tradable_window(self):
+        """Analog outcomes must start at the fill, not at the signal close.
+
+        The signal close is unreachable, so a forward return measured from it
+        silently scores a window the strategy could never have traded.
+        """
+        frame = _normalize_history(make_history(periods=400))
+        features = _compute_features(frame)
+        config = _sampling_config(frame)
+        horizon = config["horizon_days"]
+        position = 300
+        # Gap the fill well away from the signal close so a close-based
+        # denominator cannot coincidentally produce the same answer.
+        signal_close = float(frame["Close"].iloc[position])
+        fill = signal_close * 1.10
+        frame.loc[frame.index[position + 1], "Open"] = fill
+        frame.loc[frame.index[position + 1], "High"] = max(
+            fill, float(frame["High"].iloc[position + 1])
+        )
+
+        record = _match_record(
+            frame, features, position, distance=0.0, include_path=True, config=config
+        )
+        expected = (
+            float(frame["Close"].iloc[position + horizon]) / fill - 1
+        ) * 100
+
+        self.assertAlmostEqual(record["fwd_21d"], expected)
+        self.assertEqual(record["path"][0], 0.0)
+
+        from playbook import _compute_shapes
+
+        shapes = _compute_shapes(frame["Close"], config["shape_days"])
+        fast = _match_record_fast(
+            _prepare_matrices(frame, features, shapes),
+            position,
+            0.0,
+            config,
+        )
+        self.assertAlmostEqual(fast["fwd_21d"], expected)
+
+    def test_entry_price_falls_back_to_the_next_close(self):
+        opens = [10.0, float("nan"), 12.0]
+        closes = [10.5, 11.5, 12.5]
+
+        self.assertEqual(_entry_price_at(opens, closes, 1), 12.0)
+        # A missing open still lands on the session after the signal.
+        self.assertEqual(_entry_price_at(opens, closes, 0), 11.5)
+        # No session exists after the final bar.
+        self.assertIsNone(_entry_price_at(opens, closes, 2))
+
     def test_path_excursions_use_intraday_highs_and_lows(self):
         frame = _normalize_history(make_history(periods=400))
         position = 300
+        # Excursions are measured from the fill, which is the open of the
+        # session after the signal — not from the signal close.
         entry = frame["Close"].iloc[position]
         frame.loc[frame.index[position], "High"] = entry * 1.50
         frame.loc[frame.index[position], "Low"] = entry * 0.50
+        frame.loc[frame.index[position + 1], "Open"] = entry
         frame.loc[frame.index[position + 1], "High"] = entry * 1.20
         frame.loc[frame.index[position + 1], "Low"] = entry * 0.80
         record = _match_record(

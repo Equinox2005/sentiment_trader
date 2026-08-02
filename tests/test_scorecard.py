@@ -125,7 +125,7 @@ class ScorecardMetricTests(unittest.TestCase):
         self.assertIsNotNone(metrics["bootstrap_interval"])
         self.assertEqual(
             set(report["breakdowns"]),
-            {"side", "tier", "horizon", "cohort"},
+            {"side", "tier", "horizon", "cohort", "model_version"},
         )
 
     def test_pending_matured_and_expired_ungraded_are_separate(self):
@@ -254,6 +254,74 @@ class ScorecardMetricTests(unittest.TestCase):
         self.assertEqual(report["counts"]["total"], 1)
         self.assertEqual(report["counts"]["matured"], 0)
         self.assertEqual(report["counts"]["pending"], 1)
+
+    def test_repeat_views_reuse_the_report_until_the_ledger_changes(self):
+        """The page is opened far more often than the ledger changes.
+
+        Rebuilding from every stored forecast on each request makes the daily
+        view slower every night the scanner runs.
+        """
+
+        class Store:
+            def __init__(self):
+                self.reads = 0
+                self.rows = [
+                    {
+                        "id": 1,
+                        "symbol": "AAA",
+                        "as_of_date": "2025-01-02",
+                        "horizon_days": 21,
+                        "horizon_date": "2025-02-03",
+                        "status": "pending",
+                        "realized_return": None,
+                        "outcome_date": None,
+                        "entry_date": None,
+                        "side": "long",
+                        "tier": "moderate",
+                        "probability_up": 60,
+                        "baseline_up_rate": 55,
+                        "universe_id": None,
+                        "data_vintage": "v1",
+                        "model_version": "v1",
+                        "created_at": "2025-01-02T22:00:00+00:00",
+                        "graded_at": None,
+                    }
+                ]
+
+            def forecast_ledger_fingerprint(self):
+                return (len(self.rows), self.rows[-1]["id"], "", "", 0)
+
+            def list_all_forecasts(self):
+                self.reads += 1
+                return list(self.rows)
+
+        store = Store()
+        service = ScorecardService(store)
+
+        service.current(as_of_date="2025-01-31")
+        service.current(as_of_date="2025-01-31")
+        self.assertEqual(store.reads, 1)
+
+        store.rows.append(dict(store.rows[0], id=2, symbol="BBB"))
+        service.current(as_of_date="2025-01-31")
+        self.assertEqual(store.reads, 2)
+
+    def test_pre_alignment_forecasts_stay_separable_by_model_version(self):
+        report = build_scorecard(
+            [
+                observation(index, realized_return=2.0)
+                for index in range(1, 4)
+            ],
+            {},
+            as_of_date="2025-03-01",
+            minimum_sample=1,
+            bootstrap_samples=32,
+        )
+        labels = {
+            row["label"] for row in report["breakdowns"]["model_version"]
+        }
+
+        self.assertEqual(labels, {"pre-provenance"})
 
     def test_scorecard_source_has_no_fixed_probability_threshold(self):
         source = inspect.getsource(scorecard)

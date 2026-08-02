@@ -439,6 +439,46 @@ class PlaybookStore:
                     timestamp,
                 ),
             )
+            if cursor.rowcount == 0 and scan_run_id is not None:
+                # The unique key admits one row per symbol, session, and
+                # horizon, so an ad-hoc interactive lookup earlier in the day
+                # would otherwise silently outrank the scan that the board and
+                # the scorecard are actually built from. A scan claims an
+                # ungraded, unattributed row; it never rewrites graded
+                # evidence or another scan's record.
+                cursor = connection.execute(
+                    """
+                    UPDATE forecasts
+                    SET payload_json = ?,
+                        horizon_date = ?,
+                        model_version = ?,
+                        git_commit = ?,
+                        config_hash = ?,
+                        data_vintage = ?,
+                        universe_id = ?,
+                        scan_run_id = ?,
+                        created_at = ?
+                    WHERE symbol = ?
+                      AND as_of_date = ?
+                      AND horizon_days = ?
+                      AND status = 'pending'
+                      AND scan_run_id IS NULL
+                    """,
+                    (
+                        encoded,
+                        horizon_date,
+                        model_version,
+                        git_commit,
+                        config_hash,
+                        data_vintage,
+                        universe_id,
+                        scan_run_id,
+                        timestamp,
+                        symbol,
+                        as_of_date,
+                        int(horizon_days),
+                    ),
+                )
             connection.commit()
             return cursor.rowcount > 0
 
@@ -584,6 +624,32 @@ class PlaybookStore:
         with self._lock, closing(self._connect()) as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_forecast_record(row) for row in rows]
+
+    def forecast_ledger_fingerprint(self):
+        """Cheap value that changes whenever the forecast ledger changes.
+
+        Lets callers reuse a previously built scorecard without rereading and
+        rescoring every forecast on each request.
+        """
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(MAX(id), 0) AS max_id,
+                    COALESCE(MAX(created_at), '') AS last_created,
+                    COALESCE(MAX(graded_at), '') AS last_graded,
+                    SUM(status = 'graded') AS graded
+                FROM forecasts
+                """
+            ).fetchone()
+        return (
+            int(row["total"]),
+            int(row["max_id"]),
+            row["last_created"],
+            row["last_graded"],
+            int(row["graded"] or 0),
+        )
 
     def list_all_forecasts(self):
         with self._lock, closing(self._connect()) as connection:
