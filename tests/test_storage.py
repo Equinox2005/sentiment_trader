@@ -232,6 +232,114 @@ class PriceStorageTests(unittest.TestCase):
         self.assertEqual(len(service._source_cache), 2)
         self.assertNotIn("aaa", service._source_cache)
 
+    def _ledger_payload(self, **overrides):
+        payload = {
+            "entry_price": None,
+            "probability_up": 62,
+            "analog_probability_up": 62,
+            "baseline_up_rate": 54,
+            "edge_points": 8,
+            "direction": "bullish",
+            "range": {"low": -3, "typical": 4, "high": 9},
+            "evidence_score": 70,
+            "validation_grade": "positive",
+            "horizon_label": "5 sessions",
+            "snapshot_id": "interactive",
+            "exchange_timezone": "UTC",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_scan_claims_an_unattributed_interactive_forecast(self):
+        """Browsing a symbol must not outrank the scan the board is built from.
+
+        One row exists per symbol, session, and horizon, so an interactive
+        lookup earlier in the day would otherwise keep its unattributed record
+        and silently change what the scorecard measures.
+        """
+        self.store.save_forecast(
+            "AAA",
+            "2026-07-31",
+            5,
+            "2026-08-07",
+            self._ledger_payload(),
+        )
+
+        claimed = self.store.save_forecast(
+            "AAA",
+            "2026-07-31",
+            5,
+            "2026-08-07",
+            self._ledger_payload(snapshot_id="scan"),
+            model_version="v2",
+            git_commit="abc123",
+            config_hash="cfg",
+            data_vintage="sha256:feed",
+            universe_id=4,
+            scan_run_id=7,
+        )
+
+        record = self.store.list_forecasts("AAA")[0]
+        self.assertTrue(claimed)
+        self.assertEqual(record["scan_run_id"], 7)
+        self.assertEqual(record["universe_id"], 4)
+        self.assertEqual(record["model_version"], "v2")
+        self.assertEqual(record["snapshot_id"], "scan")
+
+    def test_interactive_forecast_never_overwrites_a_scan_record(self):
+        self.store.save_forecast(
+            "BBB",
+            "2026-07-31",
+            5,
+            "2026-08-07",
+            self._ledger_payload(snapshot_id="scan"),
+            model_version="v2",
+            scan_run_id=7,
+            universe_id=4,
+        )
+
+        replaced = self.store.save_forecast(
+            "BBB",
+            "2026-07-31",
+            5,
+            "2026-08-07",
+            self._ledger_payload(snapshot_id="interactive"),
+        )
+
+        record = self.store.list_forecasts("BBB")[0]
+        self.assertFalse(replaced)
+        self.assertEqual(record["scan_run_id"], 7)
+        self.assertEqual(record["snapshot_id"], "scan")
+
+    def test_scan_never_rewrites_graded_evidence(self):
+        history = price_frame(periods=30)
+        as_of_position = 10
+        as_of_date = history.index[as_of_position].date().isoformat()
+        self.store.save_forecast(
+            "CCC",
+            as_of_date,
+            5,
+            "2099-01-01",
+            self._ledger_payload(),
+        )
+        self.assertEqual(self.store.grade_pending_forecasts("CCC", history), 1)
+
+        replaced = self.store.save_forecast(
+            "CCC",
+            as_of_date,
+            5,
+            "2099-01-01",
+            self._ledger_payload(snapshot_id="scan"),
+            model_version="v2",
+            scan_run_id=7,
+        )
+
+        record = self.store.list_forecasts("CCC")[0]
+        self.assertFalse(replaced)
+        self.assertEqual(record["status"], "graded")
+        self.assertIsNone(record["scan_run_id"])
+        self.assertEqual(record["snapshot_id"], "interactive")
+
     def test_live_forecast_is_immutable_and_graded_by_future_sessions(self):
         history = price_frame(periods=30)
         as_of_position = 10

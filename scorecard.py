@@ -1,5 +1,6 @@
 import random
 import statistics
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ class ForecastObservation:
     baseline_up_rate: float | None
     universe_id: int | None
     data_vintage: str | None
+    model_version: str | None = None
 
     @classmethod
     def from_record(cls, record):
@@ -63,6 +65,7 @@ class ForecastObservation:
                 else None
             ),
             data_vintage=record.get("data_vintage"),
+            model_version=record.get("model_version"),
         )
 
 
@@ -104,10 +107,14 @@ def build_scorecard(
         and item.horizon_date is not None
         and item.horizon_date < as_of_date
     ]
+    # Identity lookup, not membership over a list: the ledger grows by the
+    # size of the universe every scan, so an O(pending x expired) scan here
+    # degrades the page as the record accumulates.
+    expired_ids = {item.id for item in expired}
     pending = [
         item
         for item in observations
-        if item.status == "pending" and item not in expired
+        if item.status == "pending" and item.id not in expired_ids
     ]
     counts = {
         "total": len(observations),
@@ -165,6 +172,16 @@ def build_scorecard(
             minimum_sample,
             bootstrap_samples,
         ),
+        # Forecasts recorded before the model measured the tradable window
+        # predicted a different quantity than they are graded on, so the
+        # record has to stay separable by the model that produced it.
+        "model_version": _breakdown(
+            scored,
+            benchmark_returns,
+            lambda item: item.model_version or "pre-provenance",
+            minimum_sample,
+            bootstrap_samples,
+        ),
     }
     cohort_dates = sorted(item.as_of_date for item in observations)
     vintages = sorted(
@@ -189,12 +206,30 @@ def build_scorecard(
 class ScorecardService:
     def __init__(self, store):
         self.store = store
+        self._cache_lock = threading.Lock()
+        self._cache_key = None
+        self._cache_value = None
 
     def current(self, as_of_date=None, as_of_timestamp=None):
         evaluation_date = as_of_date or datetime.now(
             ZoneInfo("America/New_York")
         ).date().isoformat()
         cutoff = _parse_timestamp(as_of_timestamp)
+        cache_key = None
+        fingerprint = getattr(self.store, "forecast_ledger_fingerprint", None)
+        if fingerprint is not None:
+            cache_key = (fingerprint(), evaluation_date, as_of_timestamp)
+            with self._cache_lock:
+                if cache_key == self._cache_key:
+                    return self._cache_value
+        report = self._build(evaluation_date, cutoff)
+        if cache_key is not None:
+            with self._cache_lock:
+                self._cache_key = cache_key
+                self._cache_value = report
+        return report
+
+    def _build(self, evaluation_date, cutoff):
         records = []
         for stored in self.store.list_all_forecasts():
             record = dict(stored)
