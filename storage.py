@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -6,12 +7,14 @@ import time
 from bisect import bisect_left
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 
 
 PRICE_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
+MIGRATIONS_DIRECTORY = Path(__file__).resolve().parent / "migrations"
 
 
 class PlaybookStore:
@@ -167,53 +170,14 @@ class PlaybookStore:
                 )
                 """
             )
+            _ensure_legacy_columns(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS scan_results_run_rank
                 ON scan_results(run_id, eligible, side, rank)
                 """
             )
-            columns = {
-                row["name"]
-                for row in connection.execute(
-                    "PRAGMA table_info(price_cache_meta)"
-                ).fetchall()
-            }
-            if "generation" not in columns:
-                connection.execute(
-                    """
-                    ALTER TABLE price_cache_meta
-                    ADD COLUMN generation INTEGER NOT NULL DEFAULT 0
-                    """
-                )
-            forecast_columns = {
-                row["name"]
-                for row in connection.execute(
-                    "PRAGMA table_info(forecasts)"
-                ).fetchall()
-            }
-            if "realized_price" not in forecast_columns:
-                connection.execute(
-                    "ALTER TABLE forecasts ADD COLUMN realized_price REAL"
-                )
-            if "outcome_date" not in forecast_columns:
-                connection.execute(
-                    "ALTER TABLE forecasts ADD COLUMN outcome_date TEXT"
-                )
-            scan_result_columns = {
-                row["name"]
-                for row in connection.execute(
-                    "PRAGMA table_info(scan_results)"
-                ).fetchall()
-            }
-            if "claim_owner" not in scan_result_columns:
-                connection.execute(
-                    "ALTER TABLE scan_results ADD COLUMN claim_owner TEXT"
-                )
-            if "side" not in scan_result_columns:
-                connection.execute(
-                    "ALTER TABLE scan_results ADD COLUMN side TEXT"
-                )
+            _apply_migrations(connection)
             connection.commit()
 
     def load_prices(self, symbol):
@@ -428,6 +392,13 @@ class PlaybookStore:
         horizon_date,
         payload,
         now=None,
+        *,
+        model_version=None,
+        git_commit=None,
+        config_hash=None,
+        data_vintage=None,
+        universe_id=None,
+        scan_run_id=None,
     ):
         timestamp = _iso_utc(now)
         encoded = json.dumps(
@@ -444,8 +415,14 @@ class PlaybookStore:
                     horizon_days,
                     horizon_date,
                     payload_json,
+                    model_version,
+                    git_commit,
+                    config_hash,
+                    data_vintage,
+                    universe_id,
+                    scan_run_id,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
@@ -453,6 +430,12 @@ class PlaybookStore:
                     int(horizon_days),
                     horizon_date,
                     encoded,
+                    model_version,
+                    git_commit,
+                    config_hash,
+                    data_vintage,
+                    universe_id,
+                    scan_run_id,
                     timestamp,
                 ),
             )
@@ -460,13 +443,25 @@ class PlaybookStore:
             return cursor.rowcount > 0
 
     def grade_pending_forecasts(self, symbol, history, now=None):
-        if history is None or history.empty or "Close" not in history:
+        if (
+            history is None
+            or history.empty
+            or "Open" not in history
+            or "Close" not in history
+        ):
             return 0
-        close = pd.to_numeric(history["Close"], errors="coerce").dropna()
-        if close.empty:
+        prices = pd.DataFrame(
+            {
+                "Open": pd.to_numeric(history["Open"], errors="coerce"),
+                "Close": pd.to_numeric(history["Close"], errors="coerce"),
+            }
+        ).sort_index()
+        prices = prices.dropna(subset=["Close"])
+        if prices.empty:
             return 0
-        dates = [_session_date(value) for value in close.index]
-        values = close.to_numpy(dtype=float)
+        dates = [_session_date(value) for value in prices.index]
+        opens = prices["Open"].to_numpy(dtype=float)
+        closes = prices["Close"].to_numpy(dtype=float)
         timestamp = _iso_utc(now)
 
         with self._lock, closing(self._connect()) as connection:
@@ -487,14 +482,17 @@ class PlaybookStore:
             ).fetchall()
             updates = []
             for row in rows:
-                entry_position = bisect_left(dates, row["as_of_date"])
+                signal_position = bisect_left(dates, row["as_of_date"])
                 if (
-                    entry_position >= len(dates)
-                    or dates[entry_position] != row["as_of_date"]
+                    signal_position >= len(dates)
+                    or dates[signal_position] != row["as_of_date"]
                 ):
                     continue
-                position = entry_position + int(row["horizon_days"])
+                entry_position = signal_position + 1
+                position = signal_position + int(row["horizon_days"])
                 if position >= len(dates):
+                    continue
+                if entry_position >= len(dates) or pd.isna(opens[entry_position]):
                     continue
                 payload = json.loads(row["payload_json"])
                 if not _completed_session_date(
@@ -503,8 +501,8 @@ class PlaybookStore:
                     now=now,
                 ):
                     continue
-                entry_price = float(values[entry_position])
-                realized_price = float(values[position])
+                entry_price = float(opens[entry_position])
+                realized_price = float(closes[position])
                 realized_return = (
                     (realized_price / entry_price) - 1
                 ) * 100
@@ -512,6 +510,8 @@ class PlaybookStore:
                     (
                         realized_return,
                         realized_price,
+                        dates[entry_position],
+                        entry_price,
                         dates[position],
                         timestamp,
                         row["id"],
@@ -524,6 +524,8 @@ class PlaybookStore:
                     SET status = 'graded',
                         realized_return = ?,
                         realized_price = ?,
+                        entry_date = ?,
+                        entry_price = ?,
                         outcome_date = ?,
                         graded_at = ?
                     WHERE id = ? AND status = 'pending'
@@ -557,6 +559,14 @@ class PlaybookStore:
                 horizon_days,
                 horizon_date,
                 payload_json,
+                model_version,
+                git_commit,
+                config_hash,
+                data_vintage,
+                universe_id,
+                scan_run_id,
+                entry_date,
+                entry_price,
                 status,
                 realized_return,
                 realized_price,
@@ -573,13 +583,201 @@ class PlaybookStore:
             parameters.append(int(limit))
         with self._lock, closing(self._connect()) as connection:
             rows = connection.execute(query, parameters).fetchall()
-        records = []
+        return [_forecast_record(row) for row in rows]
+
+    def list_all_forecasts(self):
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    symbol,
+                    as_of_date,
+                    horizon_days,
+                    horizon_date,
+                    payload_json,
+                    model_version,
+                    git_commit,
+                    config_hash,
+                    data_vintage,
+                    universe_id,
+                    scan_run_id,
+                    entry_date,
+                    entry_price,
+                    status,
+                    realized_return,
+                    realized_price,
+                    outcome_date,
+                    created_at,
+                    graded_at
+                FROM forecasts
+                ORDER BY as_of_date, id
+                """
+            ).fetchall()
+        return [_forecast_record(row) for row in rows]
+
+    def equal_weight_benchmark_return(
+        self,
+        universe_id,
+        entry_date,
+        outcome_date,
+    ):
+        with self._lock, closing(self._connect()) as connection:
+            universe = connection.execute(
+                """
+                SELECT constituents_json, constituent_count
+                FROM scan_universes
+                WHERE id = ?
+                """,
+                (int(universe_id),),
+            ).fetchone()
+            if universe is None:
+                return {
+                    "return": None,
+                    "constituent_count": 0,
+                    "universe_count": 0,
+                }
+            constituents = json.loads(universe["constituents_json"])
+            symbols = [
+                item.get("symbol") if isinstance(item, dict) else str(item)
+                for item in constituents
+            ]
+            symbols = [symbol for symbol in symbols if symbol]
+            prices = {}
+            for start in range(0, len(symbols), 400):
+                batch = symbols[start : start + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT symbol, session_date, open, close
+                    FROM price_bars
+                    WHERE symbol IN ({placeholders})
+                      AND session_date IN (?, ?)
+                    """,
+                    (*batch, entry_date, outcome_date),
+                ).fetchall()
+                for row in rows:
+                    prices[(row["symbol"], row["session_date"])] = row
+        returns = []
+        for symbol in symbols:
+            entry = prices.get((symbol, entry_date))
+            outcome = prices.get((symbol, outcome_date))
+            if entry is None or outcome is None:
+                continue
+            entry_price = entry["open"]
+            outcome_price = outcome["close"]
+            if (
+                entry_price is None
+                or outcome_price is None
+                or float(entry_price) <= 0
+            ):
+                continue
+            returns.append(
+                ((float(outcome_price) / float(entry_price)) - 1) * 100
+            )
+        return {
+            "return": (
+                sum(returns) / len(returns) if returns else None
+            ),
+            "constituent_count": len(returns),
+            "universe_count": int(universe["constituent_count"]),
+        }
+
+    def forecast_provenance_for_scan(self, scan_run_id):
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT model_version, git_commit, config_hash
+                FROM forecasts
+                WHERE scan_run_id = ?
+                """,
+                (int(scan_run_id),),
+            ).fetchall()
+        return {
+            column: _provenance_value(rows, column)
+            for column in ("model_version", "git_commit", "config_hash")
+        }
+
+    def append_scorecard_snapshot(
+        self,
+        *,
+        scan_run_id,
+        session_date,
+        report,
+        model_version,
+        git_commit,
+        config_hash,
+        data_vintage,
+        universe_id,
+        now=None,
+    ):
+        counts = report.get("counts", {})
+        encoded = json.dumps(
+            report,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        with self._lock, closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO scorecard_snapshots (
+                    scan_run_id,
+                    session_date,
+                    report_json,
+                    sample_count,
+                    pending_count,
+                    matured_count,
+                    expired_ungraded_count,
+                    cohort_start,
+                    cohort_end,
+                    model_version,
+                    git_commit,
+                    config_hash,
+                    data_vintage,
+                    universe_id,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(scan_run_id),
+                    session_date,
+                    encoded,
+                    int(counts.get("scored_matured", 0)),
+                    int(counts.get("pending", 0)),
+                    int(counts.get("matured", 0)),
+                    int(counts.get("expired_ungraded", 0)),
+                    report.get("cohort_start"),
+                    report.get("cohort_end"),
+                    model_version,
+                    git_commit,
+                    config_hash,
+                    data_vintage,
+                    universe_id,
+                    _iso_utc(now),
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def list_scorecard_snapshots(self, limit=None):
+        query = """
+            SELECT *
+            FROM scorecard_snapshots
+            ORDER BY id DESC
+        """
+        parameters = []
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(int(limit))
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        snapshots = []
         for row in rows:
             item = dict(row)
-            payload = json.loads(item.pop("payload_json"))
-            item.update(payload)
-            records.append(item)
-        return records
+            item["report"] = json.loads(item.pop("report_json"))
+            snapshots.append(item)
+        return snapshots
 
     def save_scan_universe(
         self,
@@ -1038,6 +1236,16 @@ class PlaybookStore:
                 FROM scan_runs
                 WHERE scan_runs.universe_id = scan_universes.id
             )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM forecasts
+                WHERE forecasts.universe_id = scan_universes.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM scorecard_snapshots
+                WHERE scorecard_snapshots.universe_id = scan_universes.id
+              )
             """
         )
 
@@ -1212,6 +1420,100 @@ class PlaybookStore:
                 int(run_id),
             ),
         )
+
+
+def _apply_migrations(connection):
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+    applied = {
+        row["version"]: row["checksum"]
+        for row in connection.execute(
+            "SELECT version, checksum FROM schema_migrations"
+        ).fetchall()
+    }
+    migration_paths = sorted(MIGRATIONS_DIRECTORY.glob("[0-9][0-9][0-9][0-9]_*.sql"))
+    for migration_path in migration_paths:
+        version, name = migration_path.stem.split("_", 1)
+        sql = migration_path.read_text(encoding="utf-8")
+        checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+        if version in applied:
+            if applied[version] != checksum:
+                raise RuntimeError(
+                    f"Applied migration {version} no longer matches its checksum."
+                )
+            continue
+        for statement in sql.split(";"):
+            statement = statement.strip()
+            if statement:
+                connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO schema_migrations (version, name, checksum, applied_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (version, name, checksum, _iso_utc()),
+        )
+
+
+def _ensure_legacy_columns(connection):
+    """Bridge schemas created before the versioned migration ledger existed."""
+
+    legacy_columns = {
+        "price_cache_meta": {
+            "generation": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "forecasts": {
+            "realized_price": "REAL",
+            "outcome_date": "TEXT",
+        },
+        "scan_results": {
+            "claim_owner": "TEXT",
+            "side": "TEXT",
+        },
+    }
+    for table, definitions in legacy_columns.items():
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+        for column, definition in definitions.items():
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
+
+
+def _forecast_record(row):
+    item = dict(row)
+    payload = json.loads(item.pop("payload_json"))
+    if payload.get("entry_reference") is None:
+        legacy_signal_close = payload.get("entry_price")
+        payload["entry_reference"] = {
+            "session_offset": 1,
+            "price_field": "Open",
+        }
+        payload.setdefault("signal_close", legacy_signal_close)
+    return {**payload, **item}
+
+
+def _provenance_value(rows, column):
+    values = sorted({row[column] for row in rows if row[column]})
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    encoded = json.dumps(values, separators=(",", ":")).encode("utf-8")
+    return f"mixed:sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _price_rows_to_frame(rows):

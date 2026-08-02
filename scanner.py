@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import datetime, time as clock_time, timezone
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen
@@ -16,6 +17,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from market_data import MarketDataError
+from provenance import current_git_commit, runtime_config_hash
+from scorecard import ScorecardService
 
 
 ALGORITHM_VERSION = "opportunity-v2"
@@ -46,6 +49,7 @@ _NON_COMMON_SUFFIX = ("W", "R", "U", "P")
 MIN_BOARD_SCORE = 18.0
 MIN_EXPECTED_MOVE = 1.5
 MIN_PRICE = 2.0
+MIN_REWARD_RISK = 1.0
 
 
 class UniverseError(RuntimeError):
@@ -550,12 +554,14 @@ def rank_analysis(analysis):
         and evidence >= 55
         and agreement_score >= 55
         and score >= 62
+        and reward_risk >= MIN_REWARD_RISK
     )
     moderate = (
         not blockers
         and grade in {"positive", "mixed"}
         and abs(edge) >= 4
         and score >= 40
+        and reward_risk >= MIN_REWARD_RISK
     )
     tier = "strong" if strong else "moderate" if moderate else "speculative"
     signal = SIGNAL_LABELS[(side, tier)]
@@ -594,6 +600,7 @@ def rank_analysis(analysis):
                 win_probability,
                 expected_move,
                 adverse_move,
+                reward_risk,
                 grade,
                 news_conflict,
                 forecast.get("horizon_label", "the next month"),
@@ -609,6 +616,7 @@ def _plain_reason(
     win_probability,
     expected_move,
     adverse_move,
+    reward_risk,
     grade,
     news_conflict,
     horizon_label,
@@ -623,6 +631,11 @@ def _plain_reason(
         support = " The untouched audit graded this matcher positively and every component agrees."
     elif tier == "moderate":
         support = f" The untouched audit graded this matcher {grade or 'inconclusive'}."
+    elif reward_risk < MIN_REWARD_RISK:
+        support = (
+            " The expected move is smaller than the adverse move, so the "
+            "reward/risk coherence floor limits this to a watchlist idea."
+        )
     else:
         support = " Evidence is thin, so treat this as a watchlist idea rather than a signal."
     conflict = (
@@ -694,6 +707,22 @@ class OpportunityScanner:
         self.lease_seconds = max(60, int(lease_seconds))
         self.scan_time = scan_time
         self.algorithm_version = algorithm_version
+        self.model_version = os.getenv(
+            "PLAYBOOK_MODEL_VERSION",
+            self.algorithm_version,
+        )
+        self.git_commit = current_git_commit()
+        self.config_hash = runtime_config_hash(
+            {
+                "algorithm_version": self.algorithm_version,
+                "model_version": self.model_version,
+                "scan_time": self.scan_time,
+                "minimum_board_score": MIN_BOARD_SCORE,
+                "minimum_expected_move": MIN_EXPECTED_MOVE,
+                "minimum_price": MIN_PRICE,
+                "minimum_reward_risk": MIN_REWARD_RISK,
+            }
+        )
         self.retry_attempts = max(1, int(retry_attempts))
         self.retry_base_seconds = max(0.0, float(retry_base_seconds))
         self.retry_max_seconds = max(
@@ -726,6 +755,7 @@ class OpportunityScanner:
             and latest["session_date"] == session_date
             and latest["algorithm_version"] == self.algorithm_version
         ):
+            self._ensure_scorecard_snapshot(latest)
             return {
                 **latest,
                 "started": False,
@@ -745,6 +775,8 @@ class OpportunityScanner:
             now=current,
         )
         if not acquired:
+            if run["status"] in {"completed", "partial"}:
+                self._ensure_scorecard_snapshot(run)
             return {
                 **run,
                 "started": False,
@@ -781,6 +813,7 @@ class OpportunityScanner:
                         item,
                         owner,
                         session_date,
+                        universe["id"],
                         force_refresh,
                         operation_now,
                     )
@@ -808,6 +841,7 @@ class OpportunityScanner:
                 warnings=warnings,
                 now=operation_now,
             )
+            self._ensure_scorecard_snapshot(result, now=operation_now)
             result["started"] = True
             return result
         except Exception as exc:
@@ -818,6 +852,30 @@ class OpportunityScanner:
                 now=operation_now,
             )
             raise
+
+    def _ensure_scorecard_snapshot(self, run, now=None):
+        if not run or run.get("status") not in {"completed", "partial"}:
+            return False
+        report = ScorecardService(self.store).current(
+            as_of_date=run["session_date"],
+            as_of_timestamp=run.get("completed_at"),
+        )
+        provenance = self.store.forecast_provenance_for_scan(run["id"])
+        return self.store.append_scorecard_snapshot(
+            scan_run_id=run["id"],
+            session_date=run["session_date"],
+            report=report,
+            model_version=(
+                provenance.get("model_version")
+                or run.get("algorithm_version")
+                or "unknown"
+            ),
+            git_commit=provenance.get("git_commit") or "unknown",
+            config_hash=provenance.get("config_hash") or "unknown",
+            data_vintage=report["data_vintage"],
+            universe_id=run.get("universe_id"),
+            now=now,
+        )
 
     def _report_progress(self, message):
         """Keep a detached or broken console from invalidating scan work."""
@@ -833,6 +891,7 @@ class OpportunityScanner:
         item,
         owner,
         expected_session,
+        universe_id,
         force_refresh,
         operation_now,
     ):
@@ -840,11 +899,28 @@ class OpportunityScanner:
         for attempt in range(1, self.retry_attempts + 1):
             self._pacer.wait()
             try:
-                analysis = self.service.analyze(
-                    symbol,
-                    force_refresh=force_refresh,
-                    include_validation=True,
+                context_factory = getattr(
+                    self.service,
+                    "forecast_context",
+                    None,
                 )
+                context = (
+                    context_factory(
+                        model_version=self.model_version,
+                        git_commit=self.git_commit,
+                        config_hash=self.config_hash,
+                        universe_id=int(universe_id),
+                        scan_run_id=int(run_id),
+                    )
+                    if context_factory is not None
+                    else nullcontext()
+                )
+                with context:
+                    analysis = self.service.analyze(
+                        symbol,
+                        force_refresh=force_refresh,
+                        include_validation=True,
+                    )
                 break
             except MarketDataError as exc:
                 if attempt == self.retry_attempts:
@@ -934,11 +1010,12 @@ class OpportunityScanner:
 
 
 BOARD_METHODOLOGY = (
-    "Every listed stock runs the same audited historical-analog engine. A name "
-    "reaches the buy board only when its closest past setups leaned up, and the "
-    "short board only when they leaned down. Expected move, probability edge, "
-    "evidence, agreement, and audited skill add score; adverse movement, "
-    "uncertainty, and conflicting news subtract it."
+    "Nasdaq-listed common stocks plus current S&P 500 constituents run the same "
+    "audited historical-analog engine by default. A name reaches the buy board "
+    "only when its closest past setups leaned up, and the short board only when "
+    "they leaned down. Expected move, probability edge, evidence, agreement, "
+    "and audited skill add score; adverse movement, uncertainty, and conflicting "
+    "news subtract it. Reward/risk below 1.0 limits a name to the speculative tier."
 )
 
 

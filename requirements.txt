@@ -1,7 +1,7 @@
-Flask>=3.1,<4
-gunicorn>=23,<24
-waitress>=3.0,<4
-pandas>=2.2,<3
+Flask==3.1.3
+gunicorn==23.0.0
+waitress==3.0.2
+pandas==2.3.3
 # yfinance 0.2.x still constructs generic timedeltas that NumPy 2.5 deprecates.
-numpy>=1.26,<2.5
-yfinance>=0.2.65,<1
+numpy==2.4.2
+yfinance==0.2.66

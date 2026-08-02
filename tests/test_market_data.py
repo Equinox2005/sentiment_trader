@@ -2,6 +2,7 @@ import math
 import threading
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -318,7 +319,7 @@ class MarketIntelligenceTests(unittest.TestCase):
         with self.assertRaises(InvalidDateError):
             self.service.analyze_as_of("TEST", "2099-01-01")
 
-    def test_only_prior_calendar_sessions_are_immutable(self):
+    def test_completed_session_boundary_requires_verified_market_close(self):
         now = pd.Timestamp("2025-06-10 20:00:00", tz="UTC")
 
         self.assertFalse(
@@ -333,11 +334,127 @@ class MarketIntelligenceTests(unittest.TestCase):
                 now=now,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             _session_is_complete(
                 pd.Timestamp("2025-06-10"),
                 timezone_name="America/New_York",
                 now=pd.Timestamp("2025-06-11 00:30:00", tz="UTC"),
+            )
+        )
+
+    def test_same_day_after_close_forecast_is_retained(self):
+        class RecordingStore:
+            def __init__(self):
+                self.deleted = []
+                self.saved = []
+
+            def grade_pending_forecasts(self, symbol, history):
+                return 0
+
+            def delete_pending_forecast(
+                self,
+                symbol,
+                as_of_date,
+                horizon_days,
+            ):
+                self.deleted.append((symbol, as_of_date, horizon_days))
+                return True
+
+            def save_forecast(self, **forecast):
+                self.saved.append(forecast)
+                return True
+
+        class Provider:
+            def __init__(self, store):
+                self.store = store
+
+        store = RecordingStore()
+        service = MarketIntelligenceService(Provider(store))
+        session = pd.Timestamp("2025-06-10", tz="America/New_York")
+        after_close = pd.Timestamp(
+            "2025-06-10 21:00:00",
+            tz="America/New_York",
+        )
+        history = pd.DataFrame(
+            {
+                "Open": [99.0],
+                "High": [102.0],
+                "Low": [98.0],
+                "Close": [101.0],
+                "Volume": [1_000_000],
+            },
+            index=pd.DatetimeIndex([session]),
+        )
+        result = {
+            "snapshot_id": "same-day-close",
+            "data_vintage": "sha256:fixture-data",
+            "exchange_timezone": "America/New_York",
+            "warnings": [],
+            "playbook": {
+                "available": True,
+                "forecast": {
+                    "horizon_days": 21,
+                    "sampling": "market_sessions",
+                    "probability_up": 62,
+                    "analog_probability_up": 62,
+                    "baseline_up_rate": 54,
+                    "edge_points": 8,
+                    "range_21d": {"low": -3, "typical": 4, "high": 9},
+                    "evidence_score": 70,
+                    "horizon_label": "21 sessions",
+                },
+                "verdict": {"direction": "bullish"},
+                "validation": {"grade": "positive"},
+            },
+        }
+        original = _session_is_complete
+
+        def at_after_close(value, timezone_name=None, now=None):
+            return original(
+                value,
+                timezone_name=timezone_name,
+                now=after_close,
+            )
+
+        with patch(
+            "market_data._session_is_complete",
+            side_effect=at_after_close,
+        ):
+            with service.forecast_context(
+                model_version="fixture-model",
+                git_commit="fixture-commit",
+                config_hash="sha256:fixture-config",
+                universe_id=9,
+                scan_run_id=12,
+            ):
+                service._record_live_forecast("AAA", history, result)
+
+        self.assertEqual(store.deleted, [])
+        self.assertEqual(len(store.saved), 1)
+        saved_payload = store.saved[0]["payload"]
+        self.assertIsNone(saved_payload["entry_price"])
+        self.assertEqual(saved_payload["signal_close"], 101.0)
+        self.assertEqual(
+            saved_payload["entry_reference"],
+            {"session_offset": 1, "price_field": "Open"},
+        )
+        self.assertEqual(store.saved[0]["model_version"], "fixture-model")
+        self.assertEqual(store.saved[0]["git_commit"], "fixture-commit")
+        self.assertEqual(
+            store.saved[0]["config_hash"],
+            "sha256:fixture-config",
+        )
+        self.assertEqual(
+            store.saved[0]["data_vintage"],
+            "sha256:fixture-data",
+        )
+        self.assertEqual(store.saved[0]["universe_id"], 9)
+        self.assertEqual(store.saved[0]["scan_run_id"], 12)
+        self.assertTrue(
+            _session_is_complete(
+                session,
+                timezone_name="America/New_York",
+                now=after_close,
             )
         )
 
@@ -363,6 +480,61 @@ class MarketIntelligenceTests(unittest.TestCase):
 
         self.assertEqual(result["summary"]["directional_accuracy"], 0)
         self.assertFalse(result["records"][0]["direction_correct"])
+
+    def test_live_track_record_uses_base_rate_probability_boundary(self):
+        record = {
+            "status": "graded",
+            "realized_return": 2.0,
+            "as_of_date": "2025-01-02",
+            "horizon_date": "2025-02-03",
+            "outcome_date": "2025-02-03",
+            "entry_date": "2025-01-03",
+            "entry_price": 100,
+            "entry_reference": {"session_offset": 1, "price_field": "Open"},
+            "signal_close": 99,
+            "probability_up": 49,
+            "baseline_up_rate": 45,
+            "edge_points": 4,
+            "direction": "bullish",
+            "range": {"low": -3, "typical": 2, "high": 6},
+            "evidence_score": 65,
+            "validation_grade": "mixed",
+            "horizon_label": "21 sessions",
+        }
+
+        result = _build_track_record("TEST", [record], [])
+
+        self.assertTrue(result["records"][0]["probability_correct"])
+        self.assertEqual(result["summary"]["probability_accuracy"], 100)
+
+    def test_pending_next_open_entry_is_rendered_without_a_fill_price(self):
+        record = {
+            "status": "pending",
+            "realized_return": None,
+            "as_of_date": "2025-01-02",
+            "horizon_date": "2025-02-03",
+            "outcome_date": None,
+            "entry_date": None,
+            "entry_price": None,
+            "entry_reference": {"session_offset": 1, "price_field": "Open"},
+            "signal_close": 99,
+            "probability_up": 60,
+            "baseline_up_rate": 55,
+            "edge_points": 5,
+            "direction": "bullish",
+            "range": {"low": -3, "typical": 2, "high": 6},
+            "evidence_score": 65,
+            "validation_grade": "mixed",
+            "horizon_label": "21 sessions",
+        }
+
+        result = _build_track_record("TEST", [record], [])
+
+        self.assertIsNone(result["records"][0]["entry_price"])
+        self.assertEqual(
+            result["records"][0]["entry_reference"],
+            {"session_offset": 1, "price_field": "Open"},
+        )
 
     def test_yahoo_bundle_fetches_independent_sources_concurrently(self):
         class ConcurrentProvider(YahooFinanceProvider):

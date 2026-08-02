@@ -1,8 +1,12 @@
 import hmac
+import math
 import os
 import threading
+import time
+from collections import defaultdict, deque
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from market_data import (
     InvalidDateError,
@@ -12,6 +16,7 @@ from market_data import (
     YahooFinanceProvider,
     normalize_symbol,
 )
+from scorecard import ScorecardService
 from scanner import (
     OpportunityBoardService,
     ScanGateError,
@@ -25,6 +30,38 @@ from storage import PlaybookStore
 
 _scan_lock = threading.Lock()
 _scan_state = {"running": False, "last_result": None, "last_error": None}
+_ANALYSIS_ENDPOINTS = {
+    "analyze",
+    "analyze_quick",
+    "analyze_audit",
+    "analyze_as_of",
+    "signal",
+    "track_record",
+    "scorecard_page",
+    "scorecard_api",
+}
+
+
+class _SlidingWindowLimiter:
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._events = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key, limit, window_seconds):
+        limit = max(1, int(limit))
+        window_seconds = max(1.0, float(window_seconds))
+        current = self._clock()
+        cutoff = current - window_seconds
+        with self._lock:
+            events = self._events[key]
+            while events and events[0] <= cutoff:
+                events.popleft()
+            if len(events) >= limit:
+                retry_after = max(1, math.ceil(events[0] + window_seconds - current))
+                return False, retry_after
+            events.append(current)
+        return True, 0
 
 
 def _run_scan_in_background(store):
@@ -62,9 +99,24 @@ def _run_scan_in_background(store):
     return True
 
 
-def create_app(service=None, board_service=None):
+def create_app(service=None, board_service=None, scorecard_service=None):
     app = Flask(__name__, instance_relative_config=True)
+    trusted_proxy_hops = max(
+        0,
+        int(os.getenv("PLAYBOOK_TRUSTED_PROXY_HOPS", "0")),
+    )
+    if trusted_proxy_hops:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=trusted_proxy_hops)
     app.config["JSON_SORT_KEYS"] = False
+    app.config["ANALYSIS_RATE_LIMIT"] = int(
+        os.getenv("PLAYBOOK_ANALYSIS_RATE_LIMIT", "60")
+    )
+    app.config["REFRESH_RATE_LIMIT"] = int(
+        os.getenv("PLAYBOOK_REFRESH_RATE_LIMIT", "6")
+    )
+    app.config["RATE_LIMIT_WINDOW_SECONDS"] = int(
+        os.getenv("PLAYBOOK_RATE_LIMIT_WINDOW_SECONDS", "60")
+    )
     if service is None:
         os.makedirs(app.instance_path, exist_ok=True)
         store_path = os.getenv(
@@ -77,15 +129,46 @@ def create_app(service=None, board_service=None):
         )
         app.extensions["playbook_store"] = store
     app.extensions["market_service"] = service
+    store = app.extensions.get("playbook_store") or getattr(
+        getattr(service, "provider", None),
+        "store",
+        None,
+    )
     if board_service is None:
-        store = app.extensions.get("playbook_store") or getattr(
-            getattr(service, "provider", None),
-            "store",
-            None,
-        )
         board_service = OpportunityBoardService(store) if store else None
     app.extensions["opportunity_board"] = board_service
+    if scorecard_service is None:
+        scorecard_service = ScorecardService(store) if store else None
+    app.extensions["scorecard"] = scorecard_service
     app.config["SCAN_TOKEN"] = os.getenv("PLAYBOOK_SCAN_TOKEN", "")
+    app.extensions["analysis_rate_limiter"] = _SlidingWindowLimiter()
+
+    @app.before_request
+    def limit_public_analysis():
+        if request.endpoint not in _ANALYSIS_ENDPOINTS:
+            return None
+        refresh = request.args.get("refresh") == "1"
+        bucket = "refresh" if refresh else "analysis"
+        limit = app.config[
+            "REFRESH_RATE_LIMIT" if refresh else "ANALYSIS_RATE_LIMIT"
+        ]
+        client = request.remote_addr or "unknown"
+        allowed, retry_after = app.extensions["analysis_rate_limiter"].allow(
+            (client, bucket),
+            limit,
+            app.config["RATE_LIMIT_WINDOW_SECONDS"],
+        )
+        if allowed:
+            return None
+        response = jsonify(
+            {
+                "error": "Too many analysis requests. Please try again later.",
+                "code": "rate_limited",
+            }
+        )
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+        return response
 
     if os.getenv("PLAYBOOK_ENABLE_SCHEDULER") == "1":
         _start_embedded_scheduler(app)
@@ -97,6 +180,30 @@ def create_app(service=None, board_service=None):
     @app.get("/opportunities")
     def opportunities_alias():
         return render_template("board.html")
+
+    @app.get("/scorecard")
+    def scorecard_page():
+        scorecard_service = app.extensions["scorecard"]
+        if scorecard_service is None:
+            return render_template("scorecard.html", report=None), 503
+        return render_template(
+            "scorecard.html",
+            report=scorecard_service.current(),
+        )
+
+    @app.get("/api/scorecard")
+    def scorecard_api():
+        scorecard_service = app.extensions["scorecard"]
+        if scorecard_service is None:
+            return jsonify(
+                {
+                    "error": "Persistent scorecard storage is not configured.",
+                    "code": "no_storage",
+                }
+            ), 503
+        response = jsonify(scorecard_service.current())
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/forecast/<symbol>")
     def forecast_page(symbol):
@@ -192,7 +299,6 @@ def create_app(service=None, board_service=None):
             )
         supplied = (
             request.headers.get("X-Playbook-Scan-Token")
-            or request.args.get("token")
             or ""
         )
         if not hmac.compare_digest(supplied, expected):
@@ -425,10 +531,8 @@ def _start_embedded_scheduler(app):
     ).start()
 
 
-app = create_app()
-
-
 if __name__ == "__main__":
+    app = create_app()
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),

@@ -1,8 +1,8 @@
 # Playbook
 
-**Today's clearest buy and short signals, ranked from the whole market.**
+**Today's clearest buy and short signals from the default covered universe.**
 
-Playbook re-scans every US-listed common stock after each close, matches today's setup against up to 20 years of history, replays what actually happened next, and publishes two ranked boards: the strongest **buy** signals and the strongest **short** signals.
+Playbook re-scans Nasdaq-listed common stocks plus current S&P 500 constituents after each close, matches today's setup against up to 20 years of history, replays what actually happened next, and publishes two ranked boards: the strongest **buy** signals and the strongest **short** signals.
 
 The home page is the board. A ticker box sits directly above it, so any symbol — including ETFs, indices, and crypto — can be scored on demand with the identical logic, and every card links to the full historical breakdown.
 
@@ -12,8 +12,8 @@ Each name carries one obvious verdict rather than a wall of numbers:
 
 | Badge | Meaning |
 | --- | --- |
-| `STRONG BUY` / `STRONG SHORT` | Positive untouched audit, a 6+ point probability edge, strong evidence, agreeing components, and no news conflict. |
-| `BUY` / `SHORT` | A positively or mixed-graded audit with a 4+ point edge and a healthy score. |
+| `STRONG BUY` / `STRONG SHORT` | Positive untouched audit, a 6+ point probability edge, strong evidence, agreeing components, no news conflict, and reward/risk of at least 1.0. |
+| `BUY` / `SHORT` | A positively or mixed-graded audit with a 4+ point edge, a healthy score, and reward/risk of at least 1.0. |
 | `WEAK BUY` / `WEAK SHORT` | A real directional lean whose audit, evidence, or news support is thin. Watchlist material. |
 | *(absent)* | The analogs did not lean far enough either way, the typical move was under 1.5%, or risk cancelled the edge. |
 
@@ -23,7 +23,7 @@ The short board is the mirror image of the long board, not an afterthought: expe
 
 ### Conviction score
 
-A transparent 0–100 score orders each side. Expected move (30), probability edge (22), evidence (16), audit grade (14), component agreement (10), and audited Brier skill (8) add points. Adverse movement (−14), interval width (−6), and headlines that fight the historical lean (−8) subtract them.
+A transparent 0–100 score orders each side. Expected move (30), probability edge (22), evidence (16), audit grade (14), component agreement (10), and audited Brier skill (8) add points. Adverse movement (−14), interval width (−6), and headlines that fight the historical lean (−8) subtract them. Reward/risk is not reweighted into this formula; below 1.0 it acts only as a coherence floor that caps the tier at speculative.
 
 ## The forecasting engine
 
@@ -38,7 +38,7 @@ It does not hide uncertainty behind a single indicator or an unexplained confide
 - probability calibration, regime/edge strata, and a continuous long-or-cash audit;
 - 5-session, 10-session, and primary-horizon distributions;
 - empirically measured split-conformal interval coverage;
-- hindsight-sealed Time Machine replays and an immutable live forecast ledger;
+- hindsight-sealed Time Machine replays and an immutable forward forecast ledger;
 - a nightly market-wide board ranking both bullish and bearish audited setups;
 - any small adjustment made by current headlines.
 
@@ -56,7 +56,7 @@ The engine uses adjusted OHLCV data and, when available, aligned SPY/VIX context
 - prior-session SPY momentum/trend and trailing VIX percentile;
 - the normalized geometry of the complete trailing one-month price path.
 
-Missing optional inputs are excluded consistently from both live matching and historical validation. Broad-market context is lagged by one US session so an earlier-closing global market never receives a US close that had not happened yet.
+Missing optional inputs are excluded consistently from both current matching and historical validation. Broad-market context is lagged by one US session so an earlier-closing global market never receives a US close that had not happened yet.
 
 ## How matching works
 
@@ -95,16 +95,16 @@ For each historical checkpoint, Playbook:
 
 The untouched evaluation period is sampled every five sessions and capped at 260 dense records. Because adjacent outcomes overlap, the 95% Wilson interval and the strategy audit use a non-overlapping subset. The UI reports directional accuracy, Brier skill versus the asset-specific base rate, calibration buckets, edge/regime strata, interval coverage, and a daily mark-to-market long-or-cash curve against continuous buy-and-hold. A small or weak sample is labeled accordingly.
 
-Time Machine applies the same engine to a history physically truncated after the selected session; historical news and current earnings metadata are excluded. The realized outcome is calculated only after the forecast payload exists. Live audited forecasts are stored once per confirmed completed session and graded from a single current adjusted-price vintage after the exact future-session count matures.
+Time Machine applies the same engine to a history physically truncated after the selected session; historical news and current earnings metadata are excluded. The realized outcome is calculated only after the forecast payload exists. Forward audited forecasts are stored once per confirmed completed session and graded from a single current adjusted-price vintage after the exact future-session count matures.
 
 ## Run locally
 
-Requires Python 3.10+.
+Requires Python 3.12.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.lock
 python app.py
 ```
 
@@ -124,7 +124,7 @@ Playbook stores adjusted OHLCV in `instance/playbook.sqlite3` and refreshes only
 
 Quick forecasts also persist a short-lived, opaque source-snapshot token. The audit endpoint uses that token to reload the exact same prices, profile, headlines, warnings, and market context—even when a different Gunicorn or Waitress worker handles the request. Expired and excess snapshots are removed automatically.
 
-The same SQLite database holds the live forecast ledger. Forecast inserts are immutable per symbol/session/horizon, unfinished daily candles are never recorded or graded, and refreshed split/dividend adjustments are applied consistently to both grading endpoints.
+The same SQLite database holds the persistent forecast ledger. Forecast inserts are immutable per symbol/session/horizon, unfinished daily candles are never recorded or graded, and refreshed split/dividend adjustments are applied consistently to both grading endpoints.
 
 ### The market-wide scanner
 
@@ -135,7 +135,7 @@ python scan_sp500.py --once --universe us          # adds NYSE / NYSE American
 python scan_sp500.py --once --max-symbols 50       # quick smoke run
 ```
 
-Run it after **5:15 PM America/New_York**. The scanner confirms the latest SPY session before creating a batch, then builds its universe from the NasdaqTrader symbol directory merged with the Wikipedia S&P 500 table so large NYSE names are not lost. Test issues, ETFs, financially delinquent issues, warrants, rights, units, and preferreds are excluded; symbols such as `BRK.B` are normalized to `BRK-B`. A live Nasdaq directory parsing fewer than 1,500 common stocks is rejected in favour of the last-known-good snapshot.
+Run it after **5:15 PM America/New_York**. The scanner confirms the latest SPY session before creating a batch, then builds its universe from the NasdaqTrader symbol directory merged with the Wikipedia S&P 500 table so large NYSE names are not lost. Test issues, ETFs, financially delinquent issues, warrants, rights, units, and preferreds are excluded; symbols such as `BRK.B` are normalized to `BRK-B`. A current Nasdaq directory parsing fewer than 1,500 common stocks is rejected in favour of the last-known-good snapshot.
 
 | Scope | Approximate size |
 | --- | --- |
@@ -215,6 +215,7 @@ Environment variables:
 - `PLAYBOOK_SCAN_RETENTION_RUNS`: number of detailed immutable board runs retained.
 - `WEB_CONCURRENCY=1`: preserves SQLite’s single-process ownership model.
 - `GUNICORN_THREADS`: concurrent HTTP request capacity inside that worker.
+- `PLAYBOOK_TRUSTED_PROXY_HOPS`: trusted ingress hops used to resolve the client address for rate limiting; the Render blueprint sets exactly one.
 
 For GitHub Actions, add repository secrets named `PLAYBOOK_SCAN_URL` (the public `https://…onrender.com` origin) and `PLAYBOOK_SCAN_TOKEN` (the generated Render value). The Render cron uses the private `hostport` reference with `PLAYBOOK_SCAN_SCHEME=http`; public GitHub triggers default to HTTPS.
 
@@ -250,9 +251,11 @@ GET  /api/signal/NVDA                       # board verdict for one symbol
 GET  /api/opportunities/latest?side=short&limit=50
 GET  /api/opportunities/history
 GET  /api/opportunities/status
+GET  /api/scorecard
 POST /api/opportunities/run                 # header: X-Playbook-Scan-Token
 
 GET  /                                      # signal board + ticker checker
+GET  /scorecard                             # site-wide forecast ledger
 GET  /forecast/NVDA
 GET  /audit/NVDA
 ```

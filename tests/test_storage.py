@@ -1,6 +1,8 @@
+import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -269,7 +271,7 @@ class PriceStorageTests(unittest.TestCase):
 
         expected = (
             history["Close"].iloc[as_of_position + 5]
-            / history["Close"].iloc[as_of_position]
+            / history["Open"].iloc[as_of_position + 1]
             - 1
         ) * 100
         self.assertTrue(first)
@@ -281,6 +283,49 @@ class PriceStorageTests(unittest.TestCase):
         self.assertEqual(
             record["outcome_date"],
             history.index[as_of_position + 5].date().isoformat(),
+        )
+
+    def test_forecast_grading_uses_next_session_open(self):
+        history = price_frame(periods=30)
+        signal_position = 10
+        as_of_date = history.index[signal_position].date().isoformat()
+        payload = {
+            "entry_price": None,
+            "entry_reference": {"session_offset": 1, "price_field": "Open"},
+            "signal_close": float(history["Close"].iloc[signal_position]),
+            "probability_up": 62,
+            "analog_probability_up": 62,
+            "baseline_up_rate": 54,
+            "edge_points": 8,
+            "direction": "bullish",
+            "range": {"low": -3, "typical": 4, "high": 9},
+            "evidence_score": 70,
+            "validation_grade": "positive",
+            "horizon_label": "5 sessions",
+            "snapshot_id": "next-open",
+            "exchange_timezone": "UTC",
+        }
+        self.store.save_forecast(
+            "AAA",
+            as_of_date,
+            5,
+            history.index[signal_position + 5].date().isoformat(),
+            payload,
+        )
+
+        graded = self.store.grade_pending_forecasts("AAA", history)
+        record = self.store.list_forecasts("AAA")[0]
+
+        expected = (
+            history["Close"].iloc[signal_position + 5]
+            / history["Open"].iloc[signal_position + 1]
+            - 1
+        ) * 100
+        self.assertEqual(graded, 1)
+        self.assertAlmostEqual(record["realized_return"], expected)
+        self.assertNotEqual(
+            history["Open"].iloc[signal_position + 1],
+            history["Close"].iloc[signal_position],
         )
 
     def test_missing_forecast_entry_session_is_not_approximately_graded(self):
@@ -404,6 +449,133 @@ class PriceStorageTests(unittest.TestCase):
             worker.join()
 
         self.assertEqual(errors, [])
+
+    def test_forecast_provenance_migration_is_versioned_and_round_trips(self):
+        path = f"{self.temp.name}\\pre-migration.sqlite3"
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                """
+                CREATE TABLE forecasts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    as_of_date TEXT NOT NULL,
+                    horizon_days INTEGER NOT NULL,
+                    horizon_date TEXT,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    realized_return REAL,
+                    realized_price REAL,
+                    outcome_date TEXT,
+                    created_at TEXT NOT NULL,
+                    graded_at TEXT,
+                    UNIQUE(symbol, as_of_date, horizon_days)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE price_cache_meta (
+                    symbol TEXT PRIMARY KEY,
+                    last_updated_at TEXT NOT NULL,
+                    last_full_refresh_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE scan_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    display_symbol TEXT NOT NULL,
+                    company_name TEXT NOT NULL,
+                    sector TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    eligible INTEGER NOT NULL DEFAULT 0,
+                    opportunity_score REAL,
+                    rank INTEGER,
+                    payload_json TEXT,
+                    error TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    UNIQUE(run_id, symbol)
+                )
+                """
+            )
+
+        migrated = PlaybookStore(path)
+        with closing(sqlite3.connect(path)) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(forecasts)")
+            }
+            versions = connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            cache_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(price_cache_meta)"
+                )
+            }
+            scan_result_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(scan_results)"
+                )
+            }
+
+        self.assertTrue(
+            {
+                "model_version",
+                "git_commit",
+                "config_hash",
+                "data_vintage",
+                "universe_id",
+            }.issubset(columns)
+        )
+        self.assertIn(("0001",), versions)
+        self.assertIn("generation", cache_columns)
+        self.assertTrue({"claim_owner", "side"}.issubset(scan_result_columns))
+
+        migrated.save_forecast(
+            "PROV",
+            "2025-06-10",
+            21,
+            "2025-07-09",
+            {
+                "entry_price": None,
+                "entry_reference": {
+                    "session_offset": 1,
+                    "price_field": "Open",
+                },
+                "exchange_timezone": "America/New_York",
+            },
+            model_version="model-v3",
+            git_commit="abc123",
+            config_hash="sha256:config",
+            data_vintage="sha256:data",
+            universe_id=17,
+            scan_run_id=31,
+        )
+        record = migrated.list_forecasts("PROV")[0]
+        scan_provenance = migrated.forecast_provenance_for_scan(31)
+
+        self.assertEqual(record["model_version"], "model-v3")
+        self.assertEqual(record["git_commit"], "abc123")
+        self.assertEqual(record["config_hash"], "sha256:config")
+        self.assertEqual(record["data_vintage"], "sha256:data")
+        self.assertEqual(record["universe_id"], 17)
+        self.assertEqual(scan_provenance["model_version"], "model-v3")
+        self.assertEqual(scan_provenance["git_commit"], "abc123")
+        self.assertEqual(scan_provenance["config_hash"], "sha256:config")
+
+        PlaybookStore(path)
+        with closing(sqlite3.connect(path)) as connection:
+            applied_count = connection.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = '0001'"
+            ).fetchone()[0]
+        self.assertEqual(applied_count, 1)
 
 
 if __name__ == "__main__":

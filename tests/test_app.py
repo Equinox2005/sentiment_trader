@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app import create_app
 from market_data import InvalidSymbolError
@@ -65,6 +66,43 @@ class StubBoard:
         return {"runs": [{"id": 1, "status": "completed"}]}
 
 
+class StubScorecard:
+    def current(self):
+        return {
+            "as_of_date": "2026-08-01",
+            "counts": {
+                "total": 1384,
+                "pending": 1384,
+                "matured": 0,
+                "expired_ungraded": 0,
+                "scored_matured": 0,
+            },
+            "headline": {
+                "available": False,
+                "minimum_sample": 30,
+                "reason": (
+                    "Headline suppressed until 30 matured long/short "
+                    "forecasts are available."
+                ),
+                "metrics": None,
+            },
+            "breakdowns": {
+                "side": [],
+                "tier": [],
+                "horizon": [],
+                "cohort": [],
+            },
+            "cohort_start": "2026-07-31",
+            "cohort_end": "2026-07-31",
+            "data_vintage": "sha256:fixture",
+            "limitations": (
+                "This is an average per-forecast price move, not a portfolio "
+                "return. It excludes costs, position sizing, capital limits, "
+                "and overlap between simultaneous forecasts."
+            ),
+        }
+
+
 class AppTests(unittest.TestCase):
     def setUp(self):
         app = create_app(StubService(), board_service=StubBoard())
@@ -87,6 +125,78 @@ class AppTests(unittest.TestCase):
             {"symbol": "AAPL", "refreshed": True},
         )
         self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_public_analysis_endpoints_are_rate_limited(self):
+        app = create_app(StubService(), board_service=StubBoard())
+        app.config.update(
+            TESTING=True,
+            SCAN_TOKEN="",
+            ANALYSIS_RATE_LIMIT=1,
+            REFRESH_RATE_LIMIT=1,
+            RATE_LIMIT_WINDOW_SECONDS=60,
+        )
+        client = app.test_client()
+
+        first = client.get("/api/analyze/AAPL")
+        limited = client.get("/api/analyze/MSFT")
+        first_refresh = client.get("/api/analyze/AAPL?refresh=1")
+        limited_refresh = client.get("/api/analyze/MSFT?refresh=1")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.get_json()["code"], "rate_limited")
+        self.assertIn("Retry-After", limited.headers)
+        self.assertEqual(first_refresh.status_code, 200)
+        self.assertEqual(limited_refresh.status_code, 429)
+
+    def test_rate_limit_uses_client_address_behind_configured_proxy(self):
+        with patch.dict(
+            "os.environ",
+            {"PLAYBOOK_TRUSTED_PROXY_HOPS": "1"},
+        ):
+            app = create_app(StubService(), board_service=StubBoard())
+        app.config.update(
+            TESTING=True,
+            ANALYSIS_RATE_LIMIT=1,
+            RATE_LIMIT_WINDOW_SECONDS=60,
+        )
+        client = app.test_client()
+
+        first_client = client.get(
+            "/api/analyze/AAPL",
+            headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+        second_client = client.get(
+            "/api/analyze/MSFT",
+            headers={"X-Forwarded-For": "203.0.113.11"},
+        )
+        limited_second_client = client.get(
+            "/api/analyze/GOOG",
+            headers={"X-Forwarded-For": "203.0.113.11"},
+        )
+
+        self.assertEqual(first_client.status_code, 200)
+        self.assertEqual(second_client.status_code, 200)
+        self.assertEqual(limited_second_client.status_code, 429)
+
+    def test_scorecard_computation_is_rate_limited(self):
+        app = create_app(
+            StubService(),
+            board_service=StubBoard(),
+            scorecard_service=StubScorecard(),
+        )
+        app.config.update(
+            TESTING=True,
+            ANALYSIS_RATE_LIMIT=1,
+            RATE_LIMIT_WINDOW_SECONDS=60,
+        )
+        client = app.test_client()
+
+        first = client.get("/api/scorecard")
+        limited = client.get("/scorecard")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(limited.status_code, 429)
 
     def test_invalid_symbol_returns_structured_error(self):
         response = self.client.get("/api/analyze/BAD")
@@ -135,6 +245,32 @@ class AppTests(unittest.TestCase):
         self.assertIn(b"Short signals", response.data)
         self.assertIn(b"Check any ticker", response.data)
         self.assertIn(b"/static/favicon.svg", response.data)
+        self.assertIn(b'href="/scorecard"', response.data)
+
+    def test_global_scorecard_is_honest_when_every_forecast_is_pending(self):
+        app = create_app(
+            StubService(),
+            board_service=StubBoard(),
+            scorecard_service=StubScorecard(),
+        )
+        app.config.update(TESTING=True, SCAN_TOKEN="")
+        client = app.test_client()
+
+        page = client.get("/scorecard")
+        api = client.get("/api/scorecard")
+
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(api.status_code, 200)
+        self.assertEqual(api.get_json()["counts"]["pending"], 1384)
+        self.assertIn(b'data-headline-available="false"', page.data)
+        self.assertIn(b"Headline suppressed until 30 matured", page.data)
+        self.assertIn(b"average per-forecast price move", page.data)
+        self.assertIn(b"not a portfolio return", page.data)
+        self.assertIn(
+            b"excludes costs, position sizing, capital limits",
+            page.data,
+        )
+        self.assertNotIn(b'id="headlineMean"', page.data)
 
     def test_favicon_asset_is_available(self):
         with self.client.get("/static/favicon.svg") as response:
@@ -192,6 +328,16 @@ class AppTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+    def test_remote_scan_trigger_rejects_token_in_query_string(self):
+        app = create_app(StubService(), board_service=StubBoard())
+        app.config.update(TESTING=True, SCAN_TOKEN="secret")
+        client = app.test_client()
+
+        response = client.post("/api/opportunities/run?token=secret")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["code"], "forbidden")
         self.assertEqual(response.get_json()["code"], "forbidden")
 
     def test_scan_status_endpoint_reports_idle_state(self):

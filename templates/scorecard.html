@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Playbook's site-wide forecast ledger scorecard, with maturity counts, same-window benchmark comparisons, and uncertainty.">
+  <title>Playbook — Forecast scorecard</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='scorecard.css') }}">
+</head>
+<body class="scorecard-page"{% if report %} data-headline-available="{{ report.headline.available|string|lower }}"{% endif %}>
+  <header class="scorecard-header">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">⟳</span>
+      <span>Playbook</span>
+    </a>
+    <a class="back-link" href="/">Signal board</a>
+  </header>
+
+  <main class="scorecard-shell">
+    <section class="scorecard-hero">
+      <span class="eyebrow">Site-wide forecast ledger</span>
+      <h1>What has the algorithm actually shown?</h1>
+      <p>The scorecard includes every stored forecast and waits for outcomes rather than filling an empty record with a flattering number.</p>
+    </section>
+
+    {% if report %}
+      <section class="maturity-grid" aria-label="Forecast maturity accounting">
+        <article><span>Pending</span><strong>{{ report.counts.pending }}</strong></article>
+        <article><span>Matured</span><strong>{{ report.counts.matured }}</strong></article>
+        <article><span>Expired, ungraded</span><strong>{{ report.counts.expired_ungraded }}</strong></article>
+        <article><span>Total stored</span><strong>{{ report.counts.total }}</strong></article>
+      </section>
+
+      <section class="headline-card">
+        <div class="headline-copy">
+          <span class="eyebrow">Direction-adjusted record</span>
+          {% if report.headline.available %}
+            {% set metrics = report.headline.metrics %}
+            <h2 id="headlineMean">{{ '%.2f'|format(metrics.mean_signal_return) }}% average per forecast</h2>
+            <p>
+              Same-window comparison across {{ metrics.benchmark_sample_size }} paired forecasts:
+              forecast average <strong>{{ '%.2f'|format(metrics.mean_paired_signal_return) if metrics.mean_paired_signal_return is not none else 'Unavailable' }}{% if metrics.mean_paired_signal_return is not none %}%{% endif %}</strong>,
+              equal-weight benchmark <strong>{{ '%.2f'|format(metrics.mean_benchmark_return) if metrics.mean_benchmark_return is not none else 'Unavailable' }}{% if metrics.mean_benchmark_return is not none %}%{% endif %}</strong>,
+              difference <strong>{{ '%.2f'|format(metrics.mean_excess_return) if metrics.mean_excess_return is not none else 'Unavailable' }}{% if metrics.mean_excess_return is not none %}%{% endif %}</strong>.
+              {% if metrics.benchmark_coverage_median is not none %}Median constituent coverage was {{ '%.1f'|format(metrics.benchmark_coverage_median) }}% (minimum {{ '%.1f'|format(metrics.benchmark_coverage_minimum) }}%).{% endif %}
+            </p>
+            <dl class="metric-list">
+              <div><dt>Sample</dt><dd>{{ metrics.sample_size }}</dd></div>
+              <div><dt>Median</dt><dd>{{ '%.2f'|format(metrics.median_signal_return) }}%</dd></div>
+              <div><dt>Dispersion</dt><dd>{{ '%.2f'|format(metrics.standard_deviation) }}%</dd></div>
+              <div><dt>Base-rate-relative hit rate</dt><dd>{{ '%.1f'|format(metrics.hit_rate) if metrics.hit_rate is not none else 'Unavailable' }}{% if metrics.hit_rate is not none %}%{% endif %}</dd></div>
+              <div><dt>Cluster-bootstrap interval</dt><dd>[{{ '%.2f'|format(metrics.bootstrap_interval[0]) }}%, {{ '%.2f'|format(metrics.bootstrap_interval[1]) }}%]</dd></div>
+            </dl>
+          {% else %}
+            <h2>No headline number yet</h2>
+            <p class="suppression-note">{{ report.headline.reason }}</p>
+          {% endif %}
+        </div>
+        <aside class="limitations" aria-label="Scorecard limitations">
+          <strong>What this number is—and is not</strong>
+          <p>{{ report.limitations }}</p>
+          <p>Simultaneous forecasts can overlap and cannot each receive the same capital. No claim about profit or earnings is made here.</p>
+        </aside>
+      </section>
+
+      <section class="breakdown-section">
+        <div>
+          <span class="eyebrow">Breakdowns</span>
+          <h2>Side, tier, horizon, and cohort</h2>
+          <p>Each row carries its own sample size. A row below the same minimum is suppressed.</p>
+        </div>
+        <div class="breakdown-grid">
+          {% for group_name, rows in report.breakdowns.items() %}
+            <article>
+              <h3>{{ group_name|capitalize }}</h3>
+              {% if rows %}
+                <ul>
+                  {% for row in rows %}
+                    <li>
+                      <span>{{ row.label }}</span>
+                      {% if row.metrics %}
+                        <strong>{{ '%.2f'|format(row.metrics.mean_signal_return) }}% · n={{ row.sample_size }}</strong>
+                      {% else %}
+                        <strong>Suppressed · n={{ row.sample_size }}</strong>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% else %}
+                <p>No matured forecasts.</p>
+              {% endif %}
+            </article>
+          {% endfor %}
+        </div>
+      </section>
+    {% else %}
+      <section class="headline-card">
+        <h2>Scorecard storage is unavailable</h2>
+      </section>
+    {% endif %}
+  </main>
+</body>
+</html>

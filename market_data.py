@@ -1,5 +1,6 @@
 import copy
 import gzip
+import hashlib
 import json
 import math
 import re
@@ -7,6 +8,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,10 +17,15 @@ import pandas as pd
 import yfinance as yf
 
 from playbook import build_playbook
+from provenance import default_forecast_provenance
 from sentiment import analyze_financial_text
 
 
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,11}$")
+US_EQUITY_TIMEZONES = frozenset(
+    {"America/New_York", "US/Eastern", "EST5EDT"}
+)
+US_EQUITY_CLOSE_TIME = (16, 0, 0)
 
 
 class InvalidSymbolError(ValueError):
@@ -331,6 +338,19 @@ class MarketIntelligenceService:
         self._request_counter = 0
         self._source_cache = {}
         self._source_cache_lock = threading.Lock()
+        self._forecast_provenance = threading.local()
+
+    @contextmanager
+    def forecast_context(self, **values):
+        previous = getattr(self._forecast_provenance, "values", None)
+        self._forecast_provenance.values = {**(previous or {}), **values}
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._forecast_provenance.values
+            else:
+                self._forecast_provenance.values = previous
 
     def analyze(
         self,
@@ -390,6 +410,7 @@ class MarketIntelligenceService:
                 ) from exc
             snapshot_id = self._store_source(symbol, source)
 
+        data_vintage = _source_vintage(source)
         history, profile, raw_news, warnings, context = copy.deepcopy(source)
 
         normalized_news = []
@@ -431,6 +452,7 @@ class MarketIntelligenceService:
             context=context,
             include_validation=include_validation,
             snapshot_id=snapshot_id,
+            data_vintage=data_vintage,
         )
         if include_validation:
             self._record_live_forecast(symbol, history, result)
@@ -707,10 +729,9 @@ class MarketIntelligenceService:
             history.index[-1],
             timezone_name=exchange_timezone,
         ):
-            store.delete_pending_forecast(
-                symbol,
-                as_of_date,
-                horizon_days,
+            result["warnings"].append(
+                "The live forecast ledger was deferred until the latest "
+                "market session is confirmed complete."
             )
             return
         start = pd.Timestamp(as_of_date)
@@ -718,18 +739,32 @@ class MarketIntelligenceService:
             horizon_date = start + pd.Timedelta(days=horizon_days)
         else:
             horizon_date = start + pd.offsets.BDay(horizon_days)
+        ranking = _ledger_ranking(result)
+        provenance = default_forecast_provenance(
+            result["data_vintage"],
+            getattr(self._forecast_provenance, "values", None),
+        )
         store.save_forecast(
             symbol=symbol,
             as_of_date=as_of_date,
             horizon_days=horizon_days,
             horizon_date=horizon_date.date().isoformat(),
             payload={
-                "entry_price": float(history["Close"].iloc[-1]),
+                "entry_price": None,
+                "entry_reference": {
+                    "session_offset": 1,
+                    "price_field": "Open",
+                },
+                "signal_close": float(history["Close"].iloc[-1]),
                 "probability_up": forecast["probability_up"],
                 "analog_probability_up": forecast["analog_probability_up"],
                 "baseline_up_rate": forecast["baseline_up_rate"],
                 "edge_points": forecast["edge_points"],
                 "direction": play["verdict"]["direction"],
+                "side": ranking["side"],
+                "tier": ranking["tier"],
+                "reward_risk": ranking.get("reward_risk"),
+                "opportunity_score": ranking.get("opportunity_score"),
                 "range": forecast["range_21d"],
                 "evidence_score": forecast["evidence_score"],
                 "validation_grade": play["validation"].get("grade"),
@@ -737,6 +772,7 @@ class MarketIntelligenceService:
                 "snapshot_id": result["snapshot_id"],
                 "exchange_timezone": exchange_timezone,
             },
+            **provenance.storage_values(),
         )
 
     def _begin_request(self, cache_key):
@@ -802,6 +838,7 @@ def _build_analysis(
     context=None,
     include_validation=True,
     snapshot_id=None,
+    data_vintage=None,
 ):
     close = pd.to_numeric(history["Close"], errors="coerce").dropna()
     if len(close) < 2:
@@ -844,6 +881,7 @@ def _build_analysis(
     return {
         "symbol": symbol,
         "snapshot_id": snapshot_id or _snapshot_id(close),
+        "data_vintage": data_vintage or f"price-snapshot:{_snapshot_id(close)}",
         "stage": "audit" if include_validation else "quick",
         "name": display_name,
         "exchange": profile.get("exchange") or profile.get("fullExchangeName") or "",
@@ -988,6 +1026,7 @@ def _index_timezone(index):
 def _session_is_complete(value, timezone_name=None, now=None):
     session = pd.Timestamp(value)
     current = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+    market_timezone_name = timezone_name
     if timezone_name:
         try:
             market_timezone = ZoneInfo(timezone_name)
@@ -997,12 +1036,41 @@ def _session_is_complete(value, timezone_name=None, now=None):
             current = current.tz_localize("UTC")
         current = current.tz_convert(market_timezone)
     elif session.tzinfo is not None:
+        market_timezone_name = str(session.tz)
         if current.tzinfo is None:
             current = current.tz_localize("UTC")
         current = current.tz_convert(session.tz)
     else:
         return False
-    return session.date() < current.date()
+    if session.date() < current.date():
+        return True
+    if session.date() > current.date():
+        return False
+    if market_timezone_name not in US_EQUITY_TIMEZONES:
+        return False
+    return (current.hour, current.minute, current.second) >= US_EQUITY_CLOSE_TIME
+
+
+def _ledger_ranking(result):
+    direction = result.get("playbook", {}).get("verdict", {}).get("direction")
+    fallback_side = (
+        "long"
+        if direction == "bullish"
+        else "short"
+        if direction == "bearish"
+        else None
+    )
+    try:
+        from scanner import rank_analysis
+
+        ranking = rank_analysis(result)
+    except (ImportError, KeyError, TypeError, ValueError):
+        ranking = {}
+    return {
+        **ranking,
+        "side": ranking.get("side") or fallback_side,
+        "tier": ranking.get("tier") or "unclassified",
+    }
 
 
 def _build_track_record(symbol, records, warnings):
@@ -1015,11 +1083,14 @@ def _build_track_record(symbol, records, warnings):
             else None
         )
         actual_up = realized_return > 0 if realized_return is not None else None
-        probability_correct = (
-            (float(record["probability_up"]) >= 50) == actual_up
-            if actual_up is not None
-            else None
-        )
+        probability_up = float(record["probability_up"])
+        baseline_up_rate = float(record["baseline_up_rate"])
+        if actual_up is None or probability_up == baseline_up_rate:
+            probability_correct = None
+        else:
+            probability_correct = (
+                probability_up > baseline_up_rate
+            ) == actual_up
         direction = record["direction"]
         direction_correct = (
             realized_return > 0
@@ -1034,9 +1105,16 @@ def _build_track_record(symbol, records, warnings):
                 "horizon_date": record["horizon_date"],
                 "outcome_date": record["outcome_date"],
                 "status": record["status"],
-                "entry_price": round(float(record["entry_price"]), 4),
-                "probability_up": float(record["probability_up"]),
-                "baseline_up_rate": float(record["baseline_up_rate"]),
+                "entry_date": record.get("entry_date"),
+                "entry_price": (
+                    round(float(record["entry_price"]), 4)
+                    if record.get("entry_price") is not None
+                    else None
+                ),
+                "entry_reference": record.get("entry_reference"),
+                "signal_close": record.get("signal_close"),
+                "probability_up": probability_up,
+                "baseline_up_rate": baseline_up_rate,
                 "edge_points": float(record["edge_points"]),
                 "direction": direction,
                 "range": record["range"],
@@ -1061,6 +1139,11 @@ def _build_track_record(symbol, records, warnings):
         item for item in graded
         if item["direction"] in {"bullish", "bearish"}
     ]
+    probability_scored = [
+        item
+        for item in graded
+        if item["probability_correct"] is not None
+    ]
     brier = (
         sum(
             (
@@ -1081,11 +1164,14 @@ def _build_track_record(symbol, records, warnings):
             "pending": len(public_records) - len(graded),
             "probability_accuracy": (
                 round(
-                    sum(item["probability_correct"] for item in graded)
-                    / len(graded)
+                    sum(
+                        item["probability_correct"]
+                        for item in probability_scored
+                    )
+                    / len(probability_scored)
                     * 100
                 )
-                if graded
+                if probability_scored
                 else None
             ),
             "directional_calls": len(directional),
@@ -1319,6 +1405,11 @@ def _serialize_source(source):
         allow_nan=False,
     ).encode("utf-8")
     return gzip.compress(encoded, compresslevel=5)
+
+
+def _source_vintage(source):
+    canonical = gzip.decompress(_serialize_source(source))
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
 def _deserialize_source(payload):

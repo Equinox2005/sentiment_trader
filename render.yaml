@@ -15,8 +15,8 @@ services:
     plan: standard
     region: oregon
     branch: main
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --config gunicorn.conf.py app:app
+    buildCommand: pip install --require-hashes -r requirements.lock
+    startCommand: gunicorn --config gunicorn.conf.py wsgi:app
     healthCheckPath: /api/health
     autoDeployTrigger: commit
     disk:
@@ -58,6 +58,10 @@ services:
         value: "8"
       - key: GUNICORN_TIMEOUT
         value: "180"
+      # Trust exactly Render's final ingress hop when resolving client IPs for
+      # the process-local public-analysis rate limiter.
+      - key: PLAYBOOK_TRUSTED_PROXY_HOPS
+        value: "1"
 
   - type: cron
     name: playbook-nightly-trigger
@@ -69,7 +73,7 @@ services:
     # The scanner itself refuses to run before the close is confirmed, so an
     # early or late trigger is safe.
     schedule: "30 22 * * 1-5"
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --require-hashes -r requirements.lock
     startCommand: python trigger_scan.py
     envVars:
       - key: PYTHON_VERSION

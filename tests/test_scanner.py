@@ -1,12 +1,17 @@
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pandas as pd
 
 from market_data import MarketDataError
 from scanner import (
     ALGORITHM_VERSION,
+    MIN_BOARD_SCORE,
+    MIN_EXPECTED_MOVE,
+    MIN_PRICE,
+    MIN_REWARD_RISK,
     MarketUniverseProvider,
     OpportunityBoardService,
     OpportunityScanner,
@@ -22,6 +27,7 @@ from scanner import (
     parse_sp500_constituents,
     rank_analysis,
 )
+from provenance import runtime_config_hash
 from storage import PlaybookStore
 
 
@@ -318,6 +324,44 @@ class ScannerTests(unittest.TestCase):
             higher_risk["opportunity_score"],
         )
 
+    def test_reward_risk_below_one_cannot_receive_top_tiers(self):
+        strong_candidate = rank_analysis(
+            audited_analysis(grade="positive", typical=8, low=-9)
+        )
+        moderate_candidate = rank_analysis(
+            audited_analysis(grade="mixed", typical=8, low=-9)
+        )
+
+        self.assertLess(strong_candidate["reward_risk"], 1.0)
+        self.assertLess(moderate_candidate["reward_risk"], 1.0)
+        self.assertEqual(strong_candidate["opportunity_score"], 67.0)
+        self.assertEqual(moderate_candidate["opportunity_score"], 62.0)
+        self.assertEqual(strong_candidate["tier"], "speculative")
+        self.assertEqual(moderate_candidate["tier"], "speculative")
+
+    def test_scanner_config_hash_captures_reward_risk_floor(self):
+        with patch.dict("os.environ", {"PLAYBOOK_CONFIG_HASH": ""}):
+            scanner = OpportunityScanner(
+                object(),
+                self.store,
+                universe_provider=object(),
+                scan_time="17:15",
+                algorithm_version="fixture-model",
+            )
+
+        expected = runtime_config_hash(
+            {
+                "algorithm_version": "fixture-model",
+                "model_version": "fixture-model",
+                "scan_time": "17:15",
+                "minimum_board_score": MIN_BOARD_SCORE,
+                "minimum_expected_move": MIN_EXPECTED_MOVE,
+                "minimum_price": MIN_PRICE,
+                "minimum_reward_risk": MIN_REWARD_RISK,
+            }
+        )
+        self.assertEqual(scanner.config_hash, expected)
+
     def test_tiny_expected_move_is_rejected(self):
         result = rank_analysis(audited_analysis(typical=0.6))
 
@@ -482,6 +526,7 @@ class ScannerTests(unittest.TestCase):
         first = scanner.run_once(now=now)
         second = scanner.run_once(now=now + timedelta(minutes=1))
         board = OpportunityBoardService(self.store).latest()
+        scorecard_snapshots = self.store.list_scorecard_snapshots()
 
         self.assertEqual(first["status"], "partial")
         self.assertEqual(first["completed_count"], 3)
@@ -498,6 +543,12 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(board["shorts"][0]["rank"], 1)
         self.assertEqual(board["short_count"], 1)
         self.assertEqual(board["eligible_count"], 3)
+        self.assertEqual(len(scorecard_snapshots), 1)
+        self.assertEqual(scorecard_snapshots[0]["scan_run_id"], first["id"])
+        self.assertEqual(
+            scorecard_snapshots[0]["report"]["counts"]["pending"],
+            0,
+        )
 
     def test_transient_market_data_failure_retries_with_backoff(self):
         delays = []
@@ -639,6 +690,7 @@ class ScannerTests(unittest.TestCase):
     def test_scan_history_retention_prunes_old_runs(self):
         self.store.scan_retention_runs = 2
         run_ids = []
+        retained_universe_id = None
         for day in (8, 9, 10):
             session = f"2025-06-{day:02d}"
             items = [{"symbol": "AAA", "name": "A", "sector": "Tech"}]
@@ -653,6 +705,17 @@ class ScannerTests(unittest.TestCase):
                 now=current,
             )
             self.assertTrue(acquired)
+            if day == 8:
+                retained_universe_id = universe_id
+                self.store.save_forecast(
+                    "AAA",
+                    session,
+                    21,
+                    "2025-07-08",
+                    {"direction": "bullish"},
+                    universe_id=universe_id,
+                    scan_run_id=run["id"],
+                )
             self.store.claim_scan_symbol(
                 run["id"], "AAA", f"owner-{day}", now=current
             )
@@ -671,6 +734,12 @@ class ScannerTests(unittest.TestCase):
         self.assertIsNotNone(self.store.get_scan_run(run_ids[1]))
         self.assertIsNotNone(self.store.get_scan_run(run_ids[2]))
         self.assertEqual(len(self.store.list_scan_runs(limit=10)), 2)
+        retained = self.store.equal_weight_benchmark_return(
+            retained_universe_id,
+            "2025-06-09",
+            "2025-07-08",
+        )
+        self.assertEqual(retained["universe_count"], 1)
 
     def test_board_can_be_restricted_to_one_side(self):
         universe_id = self.store.save_scan_universe(

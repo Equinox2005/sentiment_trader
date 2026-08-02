@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Every US-listed stock scanned nightly against 20 years of history. Clear buy and short signals, ranked, with the evidence behind each one.">
+  <meta name="description" content="Nasdaq-listed common stocks plus current S&P 500 constituents scanned nightly against 20 years of history, with ranked buy and short research signals.">
   <title>Playbook — Today’s buy and short signals</title>
   <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
@@ -17,6 +17,7 @@
       <span>Playbook</span>
     </a>
     <div class="header-actions">
+      <a class="header-link" href="/scorecard">Forecast scorecard</a>
       <span class="scan-chip" id="scanChip">Loading scan…</span>
       <button class="icon-button" id="themeToggle" type="button" aria-label="Switch color theme">◐</button>
     </div>
@@ -26,7 +27,7 @@
     <section class="board-hero">
       <h1>Today’s clearest <em class="up-text">buy</em> and <em class="down-text">short</em> signals.</h1>
       <p class="board-lede">
-        Every listed stock is re-scanned after each close. Playbook matches today’s setup
+        Nasdaq-listed common stocks plus current S&amp;P 500 constituents are re-scanned after each close. Playbook matches today’s setup
         against twenty years of history, replays what happened next, and only shows names
         where the evidence actually points somewhere.
       </p>
