@@ -157,6 +157,10 @@ class ScorecardMetricTests(unittest.TestCase):
                 "matured": 1,
                 "expired_ungraded": 1,
                 "scored_matured": 1,
+                # These fixtures predate the eligibility field, so the single
+                # matured forecast counts as unrecorded rather than rejected.
+                "board_rejected": 0,
+                "eligibility_unrecorded": 1,
             },
         )
 

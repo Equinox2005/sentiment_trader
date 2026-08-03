@@ -773,6 +773,13 @@ class MarketIntelligenceService:
                 "direction": play["verdict"]["direction"],
                 "side": ranking["side"],
                 "tier": ranking["tier"],
+                # The ledger records every symbol the engine could analyse, not
+                # only the ones the board published. Without this the record
+                # cannot answer "how did the signals I was actually shown do",
+                # and recovering it means joining against scan history that is
+                # pruned after PLAYBOOK_SCAN_RETENTION_RUNS.
+                "eligible": ranking.get("eligible"),
+                "signal": ranking.get("signal"),
                 "reward_risk": ranking.get("reward_risk"),
                 "opportunity_score": ranking.get("opportunity_score"),
                 "range": forecast["range_21d"],

@@ -180,9 +180,16 @@ def build_live_performance(
 ):
     observations = list(observations)
     evaluation_session = latest_market_session(bars, on_or_before=evaluation_date)
+    # The ledger records every symbol the engine could analyse. Averaging names
+    # the board refused would answer a question nobody asked: on the first day
+    # of live marking, 27.5% of the sample was rejected stock carrying 20% more
+    # dispersion than the published set. Only a recorded False is filtered, so
+    # vintages that never stored eligibility are unaffected.
+    rejected = [item for item in observations if item.eligible is False]
+    published = [item for item in observations if item.was_published]
     positions = [
         mark_position(item, bars.get(item.symbol, ()), evaluation_session)
-        for item in observations
+        for item in published
     ]
 
     scored = [item for item in positions if item.signed_return is not None]
@@ -205,6 +212,10 @@ def build_live_performance(
         "suspect": sum(1 for item in positions if item.state == SUSPECT),
         "matured": sum(1 for item in scored if item.state == MATURED),
         "open": sum(1 for item in scored if item.state == OPEN),
+        "board_rejected": len(rejected),
+        "eligibility_unrecorded": sum(
+            1 for item in published if item.eligible is None
+        ),
     }
 
     benchmark = _benchmark_windows(bars, scored)

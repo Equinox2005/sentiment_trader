@@ -44,6 +44,14 @@ class ForecastObservation:
     # no stored value, and callers built before this field existed must keep
     # constructing an observation without it.
     calibrated_probability_up: float | None = None
+    # None means the vintage predates the field, not that the name was rejected.
+    # Only a recorded False is treated as "the board refused to publish this".
+    eligible: bool | None = None
+
+    @property
+    def was_published(self):
+        """Did the board actually show this name, as far as the record knows."""
+        return self.eligible is not False
 
     @classmethod
     def from_record(cls, record):
@@ -77,6 +85,11 @@ class ForecastObservation:
             # against today's factor.
             calibrated_probability_up=_optional_float(
                 record.get("calibrated_probability_up")
+            ),
+            eligible=(
+                bool(record["eligible"])
+                if record.get("eligible") is not None
+                else None
             ),
             universe_id=(
                 int(record["universe_id"])
@@ -201,11 +214,18 @@ def build_scorecard(
         for item in observations
         if item.status == "graded" and item.realized_return is not None
     ]
+    # The headline answers "how did the signals I was shown do", so names the
+    # board refused are excluded from it. They stay in `counts` rather than
+    # disappearing. A forecast whose vintage never recorded eligibility cannot
+    # be filtered and is counted separately so the gap is visible.
+    published = [item for item in matured if item.was_published]
     scored = [
         item
-        for item in matured
+        for item in published
         if direction_adjusted_return(item.side, item.realized_return) is not None
     ]
+    rejected = [item for item in matured if item.eligible is False]
+    unknown_eligibility = [item for item in matured if item.eligible is None]
     expired = [
         item
         for item in observations
@@ -228,6 +248,8 @@ def build_scorecard(
         "matured": len(matured),
         "expired_ungraded": len(expired),
         "scored_matured": len(scored),
+        "board_rejected": len(rejected),
+        "eligibility_unrecorded": len(unknown_eligibility),
     }
     headline_metrics = _metric_summary(
         scored,
