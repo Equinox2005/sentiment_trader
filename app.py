@@ -16,6 +16,7 @@ from market_data import (
     YahooFinanceProvider,
     normalize_symbol,
 )
+from performance import LivePerformanceService
 from scorecard import ScorecardService
 from scanner import (
     OpportunityBoardService,
@@ -39,6 +40,8 @@ _ANALYSIS_ENDPOINTS = {
     "track_record",
     "scorecard_page",
     "scorecard_api",
+    "performance_page",
+    "performance_api",
 }
 
 
@@ -99,7 +102,12 @@ def _run_scan_in_background(store):
     return True
 
 
-def create_app(service=None, board_service=None, scorecard_service=None):
+def create_app(
+    service=None,
+    board_service=None,
+    scorecard_service=None,
+    performance_service=None,
+):
     app = Flask(__name__, instance_relative_config=True)
     trusted_proxy_hops = max(
         0,
@@ -140,6 +148,9 @@ def create_app(service=None, board_service=None, scorecard_service=None):
     if scorecard_service is None:
         scorecard_service = ScorecardService(store) if store else None
     app.extensions["scorecard"] = scorecard_service
+    if performance_service is None:
+        performance_service = LivePerformanceService(store) if store else None
+    app.extensions["live_performance"] = performance_service
     app.config["SCAN_TOKEN"] = os.getenv("PLAYBOOK_SCAN_TOKEN", "")
     app.extensions["analysis_rate_limiter"] = _SlidingWindowLimiter()
 
@@ -202,6 +213,30 @@ def create_app(service=None, board_service=None, scorecard_service=None):
                 }
             ), 503
         response = jsonify(scorecard_service.current())
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/performance")
+    def performance_page():
+        performance_service = app.extensions["live_performance"]
+        if performance_service is None:
+            return render_template("performance.html", report=None), 503
+        return render_template(
+            "performance.html",
+            report=performance_service.current(),
+        )
+
+    @app.get("/api/performance")
+    def performance_api():
+        performance_service = app.extensions["live_performance"]
+        if performance_service is None:
+            return jsonify(
+                {
+                    "error": "Persistent forecast storage is not configured.",
+                    "code": "no_storage",
+                }
+            ), 503
+        response = jsonify(performance_service.current())
         response.headers["Cache-Control"] = "no-store"
         return response
 

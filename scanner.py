@@ -48,8 +48,30 @@ _NON_COMMON_SUFFIX = ("W", "R", "U", "P")
 # Minimum quality gates before a symbol may appear on the board at all.
 MIN_BOARD_SCORE = 18.0
 MIN_EXPECTED_MOVE = 1.5
-MIN_PRICE = 2.0
+# A blind 26,347-cell replay found sub-$5 signals returned 0.43 points *below*
+# an equal-weight basket of the same names at more than double the dispersion.
+# A $5 floor drops that bucket while keeping 91.5% of the board; raising it to
+# $15 bought only 0.09 more points of excess for a third of the coverage.
+MIN_PRICE = 5.0
 MIN_REWARD_RISK = 1.0
+
+# The 20th-80th band cannot measure downside when it sits entirely on one side
+# of zero: adverse movement reads as 0 and reward/risk explodes against a fixed
+# floor. Those signals showed a median reward/risk of 15.1 while actually
+# dipping 13.0% intraperiod, worse than signals whose band does cross zero.
+# Falling back to a share of the band's own spread keeps the ratio on a scale
+# the forecast actually measured.
+MIN_RISK_FLOOR = 0.5
+RISK_FLOOR_WIDTH_SHARE = 0.25
+
+# Requiring reward/risk at entry rather than only capping the tier lifted the
+# realized win rate from 53.9% to 58.2% out of sample, but it also removes
+# roughly 85% of board entries. Opt in with PLAYBOOK_REQUIRE_REWARD_RISK=1.
+REQUIRE_REWARD_RISK_ENV = "PLAYBOOK_REQUIRE_REWARD_RISK"
+
+
+def _reward_risk_required():
+    return os.environ.get(REQUIRE_REWARD_RISK_ENV, "").strip() in {"1", "true", "yes"}
 
 
 class UniverseError(RuntimeError):
@@ -477,7 +499,14 @@ def rank_analysis(analysis):
     agreement_score = float(agreement.get("score", 0))
     brier_skill = float(validation.get("brier_skill") or -100)
     grade = validation.get("grade")
-    probability_up = float(forecast.get("probability_up", 50))
+    # The displayed win probability uses the recalibrated value; ranking and
+    # tier gating below stay on raw edge_points so the board ordering and the
+    # forecast ledger keep one definition.
+    probability_up = float(
+        forecast.get("calibrated_probability_up")
+        if forecast.get("calibrated_probability_up") is not None
+        else forecast.get("probability_up", 50)
+    )
     analog_direction = forecast.get("analog_direction")
     direction = forecast.get("direction")
     price = float(analysis.get("quote", {}).get("price") or 0)
@@ -508,7 +537,8 @@ def rank_analysis(analysis):
         favorable_move = max(0.0, -low)
         win_probability = 100.0 - probability_up
 
-    reward_risk = expected_move / max(adverse_move, 0.5)
+    risk_floor = max(MIN_RISK_FLOOR, RISK_FLOOR_WIDTH_SHARE * width)
+    reward_risk = expected_move / max(adverse_move, risk_floor)
 
     move_points = _clamp(expected_move / 12.0 * 30.0, 0.0, 30.0)
     edge_points = _clamp(abs(edge) / 15.0 * 22.0, 0.0, 22.0)
@@ -543,6 +573,11 @@ def rank_analysis(analysis):
         )
     if price and price < MIN_PRICE:
         blockers.append(f"The share price is below ${MIN_PRICE:.0f}.")
+    if _reward_risk_required() and reward_risk < MIN_REWARD_RISK:
+        blockers.append(
+            "The expected move does not clear the adverse move, so reward "
+            "versus risk is below the required minimum."
+        )
     if score < MIN_BOARD_SCORE:
         blockers.append("Risk and uncertainty cancelled the historical edge.")
 

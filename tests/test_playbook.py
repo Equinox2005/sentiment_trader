@@ -206,10 +206,18 @@ class PlaybookTests(unittest.TestCase):
     def test_probability_waterfall_agreement_and_twin_support_are_explainable(self):
         forecast = self.result["forecast"]
 
-        self.assertEqual(len(forecast["waterfall"]), 4)
+        self.assertEqual(len(forecast["waterfall"]), 5)
+        # The chain ends on the published, recalibrated figure; the step before
+        # it is the raw news-adjusted probability the ledger still records.
+        self.assertEqual(forecast["waterfall"][-1]["label"], "Measured calibration")
+        self.assertAlmostEqual(
+            forecast["waterfall"][-2]["value"],
+            forecast["probability_up"],
+            delta=1,
+        )
         self.assertAlmostEqual(
             forecast["waterfall"][-1]["value"],
-            forecast["probability_up"],
+            forecast["calibrated_probability_up"],
             delta=1,
         )
         for previous, current in zip(

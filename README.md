@@ -23,7 +23,9 @@ The short board is the mirror image of the long board, not an afterthought: expe
 
 ### Conviction score
 
-A transparent 0–100 score orders each side. Expected move (30), probability edge (22), evidence (16), audit grade (14), component agreement (10), and audited Brier skill (8) add points. Adverse movement (−14), interval width (−6), and headlines that fight the historical lean (−8) subtract them. Reward/risk is not reweighted into this formula; below 1.0 it acts only as a coherence floor that caps the tier at speculative.
+A transparent 0–100 score orders each side. Expected move (30), probability edge (22), evidence (16), audit grade (14), component agreement (10), and audited Brier skill (8) add points. Adverse movement (−14), interval width (−6), and headlines that fight the historical lean (−8) subtract them. Reward/risk is not reweighted into this formula; below 1.0 it acts only as a coherence floor that caps the tier at speculative. Folding reward/risk into the score was tested against the blind replay described below and made results worse in both halves of the sample, so the coherence-floor design stands on measurement rather than taste.
+
+Adverse movement is read from the 20th–80th band, which cannot see downside when it sits entirely on one side of zero. Risk then falls back to a quarter of the band's own spread instead of a token floor, because signals in that state were reporting a median reward/risk of 15.1 while actually dipping 13.0% intraperiod.
 
 ## The forecasting engine
 
@@ -97,6 +99,24 @@ The untouched evaluation period is sampled every five sessions and capped at 260
 
 Time Machine applies the same engine to a history physically truncated after the selected session; historical news and current earnings metadata are excluded. The realized outcome is calculated only after the forecast payload exists. Forward audited forecasts are stored once per confirmed completed session and graded from a single current adjusted-price vintage after the exact future-session count matures.
 
+## Measured calibration
+
+The per-symbol audit grades each matcher against its own history. It never established whether a published probability means the same thing across the whole market, so a blind replay was run to find out: 220 symbols × 126 non-overlapping 21-session windows, 2016-01-04 to 2026-06-12, 26,347 forecasts, each built on a history and market context physically truncated at its own session and graded afterwards on the production convention of buying the next open.
+
+The raw probability turned out to be monotonic but far too dispersed. Setups carrying a stated 75% chance finished higher about 58% of the time, and the raw number scored *worse* than simply quoting the asset's own base rate. `calibration.py` therefore shrinks the stated edge toward that base rate in logit space, with the factor fitted on the first half of the replay and measured on the untouched second half:
+
+| | Brier | Skill vs base rate |
+| --- | ---: | ---: |
+| Raw probability | 0.2552 | −1.2% |
+| Shrunk toward base rate | 0.2489 | **+1.3%** |
+| Base rate alone | 0.2494 | +1.1% |
+
+Two things in that table are worth stating plainly. The fitted factor of 0.132 means roughly seven eighths of the stated edge was noise, and the matcher's contribution over a plain base rate is about 0.2 Brier points. Discrimination is unchanged by this transform — AUC 0.5548 against a coin flip's 0.5000 — because calibration corrects stated confidence, not the ranking itself.
+
+The adjustment appears as an explicit **Measured calibration** step in the probability waterfall rather than being applied silently. `probability_up` and `edge_points` keep their raw values so board ranking, tier gating, and every forecast already written to the ledger stay on one definition; `calibrated_probability_up` is what the interface publishes. `PLAYBOOK_PROBABILITY_SHRINK` overrides the factor, where `1.0` disables calibration and `0.0` quotes the base rate alone.
+
+The same replay found no calibration worth shipping for the magnitude estimate: predicting a flat zero beat both the raw typical move and every fitted rescaling of it. That estimate should be read as an ordinal hint, not a point forecast.
+
 ## Run locally
 
 Requires Python 3.12.
@@ -145,7 +165,7 @@ Run it after **5:15 PM America/New_York**. The scanner confirms the latest SPY s
 
 Each `(market session, algorithm version)` batch is immutable. SQLite stores the exact universe snapshot, per-symbol state, side, raw ranking factors, failures, runtime, and a bounded cross-process lease. If a run is interrupted, rerunning after the lease expires resumes unfinished symbols without recomputing completed ones, and a second process cannot steal an active lease. New symbol attempts are globally paced across workers. Transient market-data failures receive a three-attempt exponential-backoff budget with jitter; exhausted failures produce an explicit partial board and visible unavailable count rather than an empty board that looks like “no signals.” Detailed scan history is retained for 30 runs by default, and SQLite reuses the freed pages without an expensive nightly `VACUUM`.
 
-A name reaches a board when its analogs lean clearly in one direction, the untouched audit ran, the typical move is at least 1.5%, the share price is at least $2, and risk has not cancelled the edge. Audit grade, evidence, agreement, and news conflict then decide **which tier** it lands in rather than silently hiding it — that is what makes the board return dozens of ranked names instead of a handful.
+A name reaches a board when its analogs lean clearly in one direction, the untouched audit ran, the typical move is at least 1.5%, the share price is at least $5, and risk has not cancelled the edge. Setting `PLAYBOOK_REQUIRE_REWARD_RISK=1` additionally requires reward/risk of at least 1.0 at entry, which lifted the measured win rate from 53.9% to 58.2% but removes roughly 85% of board entries. Audit grade, evidence, agreement, and news conflict then decide **which tier** it lands in rather than silently hiding it — that is what makes the board return dozens of ranked names instead of a handful.
 
 Tune with `PLAYBOOK_SCAN_WORKERS` (maximum 16), `PLAYBOOK_UNIVERSE`, `PLAYBOOK_MAX_SYMBOLS`, `PLAYBOOK_SCAN_TIME`, and `PLAYBOOK_DATA_CACHE`. Rate-limit controls are `PLAYBOOK_SCAN_REQUEST_INTERVAL` (default `0.4` seconds), `PLAYBOOK_SCAN_RETRY_ATTEMPTS` (default `3`), `PLAYBOOK_SCAN_RETRY_BASE_SECONDS` (default `2`), `PLAYBOOK_SCAN_RETRY_MAX_SECONDS` (default `30`), and `PLAYBOOK_SCAN_RETRY_JITTER_SECONDS` (default `1`). `PLAYBOOK_SCAN_RETENTION_RUNS` defaults to `30`.
 
@@ -252,9 +272,11 @@ GET  /api/opportunities/latest?side=short&limit=50
 GET  /api/opportunities/history
 GET  /api/opportunities/status
 GET  /api/scorecard
+GET  /api/performance                       # running mark-to-market
 POST /api/opportunities/run                 # header: X-Playbook-Scan-Token
 
 GET  /                                      # signal board + ticker checker
+GET  /performance                           # live returns, updated daily
 GET  /scorecard                             # site-wide forecast ledger
 GET  /forecast/NVDA
 GET  /audit/NVDA
@@ -265,6 +287,18 @@ GET  /audit/NVDA
 The original endpoint remains backward compatible. The detail page requests `/quick` first so the fingerprint, twins, projection, and preliminary forecast paint immediately, then passes its snapshot token to `/audit` for adaptive weight selection, separate interval calibration, and untouched evaluation on the exact same source data. `/forecast/<symbol>` and `/audit/<symbol>` are durable shareable routes.
 
 The board serves the latest completed scan while a newer run progresses, and all read-only board APIs use `no-store`. Scan triggering requires the shared token, so the board cannot be abused into recomputing the market on demand. Forecast responses remain cached in memory for five minutes. Use `?refresh=1` on the original or quick endpoint to create a fresh price snapshot; snapshot-bound audit requests intentionally reject refresh.
+
+## Live returns
+
+`/performance` answers "how is the current cohort actually doing?" while the horizon is still open. The scorecard waits for a forecast to mature; this page marks every open forecast to the latest stored close each trading day, using the same convention the grader settles on — buy the open of the session after the signal, measure to a session close — so the running number converges on the graded one instead of contradicting it. A forecast that has already been graded is read back from the ledger rather than recomputed.
+
+It publishes the average and median return per forecast, the share that are positive, the split by side, and an equal-weight comparator holding every symbol in the ledger over the identical window.
+
+Four leaderboards rank up to 50 names each: best and worst longs, best and worst shorts. A "top returns" table is never padded to a fixed length with losing names, so a short list means the cohort genuinely has that few names in profit. When a table is truncated it states the full population it was drawn from.
+
+Three groups stay out of the average and are reported instead of hidden: neutral forecasts, which assert no direction; positions whose holding window contains a session-to-session move beyond +300% or −75%, which is the signature of a reverse split the cached history has not been adjusted for; and sessions in which fewer than a fifth of tracked symbols traded, so a single crypto ticker's weekend bar cannot advance the board early. A rising withheld count means stale unadjusted price history, not market volatility.
+
+The number is an equal-weight average price move per forecast before costs. It is not a portfolio return and open positions are marked at an unrealised price.
 
 ## Docker
 
