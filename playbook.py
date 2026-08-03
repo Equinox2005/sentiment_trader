@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
+from calibration import (
+    CALIBRATION_PROVENANCE,
+    calibrate_probability,
+    shrink_factor,
+)
+
 
 FEATURE_WARMUP = 260
 FORWARD_DAYS = 21
@@ -1616,6 +1622,11 @@ def _build_forecast(summary, news_score, news_count, validation, config):
             }
         )
 
+    # Presentation-only recalibration. The raw probability is monotonic but far
+    # too dispersed, so the published number is pulled toward the asset's own
+    # as-of up-rate. Ranking, tier gating, and the ledger keep the raw values.
+    calibrated = calibrate_probability(combined, baseline)
+
     return {
         "horizon_days": config["horizon_days"],
         "horizon_label": config["horizon_label"],
@@ -1623,6 +1634,13 @@ def _build_forecast(summary, news_score, news_count, validation, config):
         "direction": direction,
         "analog_direction": analog_direction,
         "probability_up": round(combined),
+        "calibrated_probability_up": (
+            round(calibrated) if calibrated is not None else None
+        ),
+        "calibration": {
+            "shrink_factor": shrink_factor(),
+            **CALIBRATION_PROVENANCE,
+        },
         "analog_probability_up": round(analog),
         "baseline_up_rate": round(baseline),
         "edge_points": round(edge, 1),
@@ -1669,6 +1687,17 @@ def _build_forecast(summary, news_score, news_count, validation, config):
                 "value": round(combined, 1),
                 "delta": round(combined - analog, 1),
             },
+            *(
+                [
+                    {
+                        "label": "Measured calibration",
+                        "value": round(calibrated, 1),
+                        "delta": round(calibrated - combined, 1),
+                    }
+                ]
+                if calibrated is not None
+                else []
+            ),
         ],
         "agreement": _agreement_summary(
             summary,
@@ -1680,7 +1709,17 @@ def _build_forecast(summary, news_score, news_count, validation, config):
         "explanation": (
             f"Closest setups imply {round(analog)}% odds of finishing higher, "
             f"versus this asset's {round(baseline)}% normal historical rate. "
-            f"Recent headlines adjust the displayed estimate by {news_adjustment:+.1f} points."
+            f"Recent headlines adjust the displayed estimate by {news_adjustment:+.1f} points. "
+            f"A blind market-wide replay showed raw analog odds are far too "
+            f"spread out, so the published figure is pulled back toward the base "
+            f"rate, giving {round(calibrated)}%."
+            if calibrated is not None
+            else (
+                f"Closest setups imply {round(analog)}% odds of finishing higher, "
+                f"versus this asset's {round(baseline)}% normal historical rate. "
+                f"Recent headlines adjust the displayed estimate by "
+                f"{news_adjustment:+.1f} points."
+            )
         ),
     }
 

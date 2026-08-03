@@ -246,10 +246,15 @@ function renderForecast(play) {
   $("setupLine").textContent = play.setup;
   $("setupLine").hidden = false;
 
-  $("probabilityValue").textContent = `${forecast.probability_up}%`;
+  // Published odds use the recalibrated figure. Raw analog odds are monotonic
+  // but far too dispersed, so the headline number would otherwise overstate
+  // confidence; the waterfall below shows the adjustment explicitly.
+  const publishedProbability =
+    forecast.calibrated_probability_up ?? forecast.probability_up;
+  $("probabilityValue").textContent = `${publishedProbability}%`;
   $("probabilityRing").style.setProperty(
     "--probability",
-    `${forecast.probability_up * 3.6}deg`,
+    `${publishedProbability * 3.6}deg`,
   );
   $("probabilityInterval").textContent =
     `Analog evidence range: ${forecast.probability_low}–${forecast.probability_high}%`;

@@ -339,6 +339,41 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(strong_candidate["tier"], "speculative")
         self.assertEqual(moderate_candidate["tier"], "speculative")
 
+    def test_one_sided_band_does_not_report_limitless_reward_risk(self):
+        # The 20th-80th band never crosses zero, so measured adverse movement is
+        # zero. Risk must fall back to the band's own spread instead of dividing
+        # by a token floor and reporting a ratio in the double digits.
+        one_sided = rank_analysis(
+            audited_analysis(grade="positive", typical=8, low=2.0, high=18.0)
+        )
+
+        self.assertEqual(one_sided["adverse_move"], 0.0)
+        self.assertLess(one_sided["reward_risk"], 4.0)
+        self.assertGreater(one_sided["reward_risk"], 1.0)
+
+    def test_penny_stocks_are_blocked_by_the_price_floor(self):
+        cheap = audited_analysis()
+        cheap["quote"]["price"] = 3.10
+        blocked = rank_analysis(cheap)
+
+        self.assertFalse(blocked["eligible"])
+        self.assertIn("price is below", blocked["reason"])
+
+        priced = audited_analysis()
+        priced["quote"]["price"] = 12.0
+        self.assertTrue(rank_analysis(priced)["eligible"])
+
+    def test_reward_risk_requirement_is_opt_in(self):
+        thin = audited_analysis(grade="positive", typical=8, low=-9)
+
+        self.assertTrue(rank_analysis(thin)["eligible"])
+
+        with patch.dict("os.environ", {"PLAYBOOK_REQUIRE_REWARD_RISK": "1"}):
+            gated = rank_analysis(thin)
+
+        self.assertFalse(gated["eligible"])
+        self.assertIn("reward", gated["reason"].lower())
+
     def test_scanner_config_hash_captures_reward_risk_floor(self):
         with patch.dict("os.environ", {"PLAYBOOK_CONFIG_HASH": ""}):
             scanner = OpportunityScanner(
