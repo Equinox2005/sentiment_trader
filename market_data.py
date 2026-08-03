@@ -757,6 +757,16 @@ class MarketIntelligenceService:
                 },
                 "signal_close": float(history["Close"].iloc[-1]),
                 "probability_up": forecast["probability_up"],
+                # Record what was actually published and the factor that produced
+                # it. The calibrated value is derivable from the raw probability
+                # and the base rate, but only against the factor in force at the
+                # time -- refitting it later would silently rewrite history.
+                "calibrated_probability_up": forecast.get(
+                    "calibrated_probability_up"
+                ),
+                "probability_shrink_factor": (
+                    forecast.get("calibration", {}).get("shrink_factor")
+                ),
                 "analog_probability_up": forecast["analog_probability_up"],
                 "baseline_up_rate": forecast["baseline_up_rate"],
                 "edge_points": forecast["edge_points"],

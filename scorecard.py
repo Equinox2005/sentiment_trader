@@ -13,6 +13,14 @@ MINIMUM_HEADLINE_SAMPLE = 30
 BOOTSTRAP_CONFIDENCE = 0.95
 BOOTSTRAP_SAMPLES = 2_000
 
+# Wide enough that live buckets fill in reasonable time, and matched to the
+# bands the blind replay reported so forward drift is comparable to the fit.
+# Edges are generated rather than written out: these group forecasts for
+# display and must never read as a fixed decision threshold, which is what
+# `_decision_hit` deliberately avoids by comparing against the base rate.
+_BUCKET_EDGES = (0, *range(45, 71, 5), 100)
+CALIBRATION_BUCKETS = tuple(zip(_BUCKET_EDGES, _BUCKET_EDGES[1:]))
+
 
 @dataclass(frozen=True)
 class ForecastObservation:
@@ -32,6 +40,10 @@ class ForecastObservation:
     universe_id: int | None
     data_vintage: str | None
     model_version: str | None = None
+    # Optional and last: every forecast written before calibration shipped has
+    # no stored value, and callers built before this field existed must keep
+    # constructing an observation without it.
+    calibrated_probability_up: float | None = None
 
     @classmethod
     def from_record(cls, record):
@@ -59,6 +71,13 @@ class ForecastObservation:
             tier=record.get("tier") or "unclassified",
             probability_up=_optional_float(record.get("probability_up")),
             baseline_up_rate=_optional_float(record.get("baseline_up_rate")),
+            # Forecasts written before calibration shipped have no stored value.
+            # Deriving one is only sound when the factor in force is also known,
+            # so an unrecorded vintage stays None rather than being back-filled
+            # against today's factor.
+            calibrated_probability_up=_optional_float(
+                record.get("calibrated_probability_up")
+            ),
             universe_id=(
                 int(record["universe_id"])
                 if record.get("universe_id") is not None
@@ -67,6 +86,93 @@ class ForecastObservation:
             data_vintage=record.get("data_vintage"),
             model_version=record.get("model_version"),
         )
+
+
+def calibration_summary(matured, buckets=CALIBRATION_BUCKETS):
+    """Measure the published probability against outcomes that already matured.
+
+    This is the only calibration evidence that cannot be overfitted: every
+    forecast here was written before its outcome existed. The panel in
+    ``backtest/`` fitted the shrink factor; this reports whether the fit is
+    holding on live forward data.
+
+    The probability answers "does this finish higher", so the outcome is the raw
+    realized return regardless of which side the board took.
+    """
+    graded = [
+        item
+        for item in matured
+        if item.probability_up is not None and item.realized_return is not None
+    ]
+    if not graded:
+        return {
+            "available": False,
+            "reason": "No matured forecast carries a recorded probability yet.",
+        }
+
+    outcomes = [1.0 if item.realized_return > 0 else 0.0 for item in graded]
+    base_rate = sum(outcomes) / len(outcomes)
+
+    def _brier(values):
+        return sum(
+            (probability / 100.0 - outcome) ** 2
+            for probability, outcome in zip(values, outcomes)
+        ) / len(outcomes)
+
+    raw = _brier([item.probability_up for item in graded])
+    reference = sum((base_rate - outcome) ** 2 for outcome in outcomes) / len(outcomes)
+
+    published = [
+        item.calibrated_probability_up
+        if item.calibrated_probability_up is not None
+        else item.probability_up
+        for item in graded
+    ]
+    calibrated = _brier(published)
+    recorded = sum(
+        1 for item in graded if item.calibrated_probability_up is not None
+    )
+
+    rows = []
+    for low, high in buckets:
+        members = [
+            (probability, outcome)
+            for probability, outcome in zip(published, outcomes)
+            if low <= probability < high
+        ]
+        if not members:
+            continue
+        predicted = sum(probability for probability, _ in members) / len(members)
+        realized = sum(outcome for _, outcome in members) / len(members) * 100
+        rows.append(
+            {
+                "bucket": f"{low}-{high}",
+                "count": len(members),
+                "predicted_up": _rounded(predicted),
+                "realized_up": _rounded(realized),
+                "gap_points": _rounded(realized - predicted),
+            }
+        )
+
+    return {
+        "available": True,
+        "sample": len(graded),
+        "calibrated_sample": recorded,
+        "realized_up_rate": _rounded(base_rate * 100),
+        "brier_raw": round(raw, 4),
+        "brier_published": round(calibrated, 4),
+        "brier_base_rate": round(reference, 4),
+        # Every matured forecast resolved the same way, so a base rate of 0 or
+        # 100% has nothing to be skilful against. Report no skill rather than
+        # dividing by zero.
+        "skill_raw_points": (
+            _rounded(100 * (1 - raw / reference)) if reference > 0 else None
+        ),
+        "skill_published_points": (
+            _rounded(100 * (1 - calibrated / reference)) if reference > 0 else None
+        ),
+        "buckets": rows,
+    }
 
 
 def direction_adjusted_return(side, realized_return):
@@ -191,6 +297,9 @@ def build_scorecard(
         "as_of_date": as_of_date,
         "counts": counts,
         "headline": headline,
+        # Measured on every matured forecast, not just the long/short scored
+        # subset: a neutral call still stated a probability and still resolved.
+        "calibration": calibration_summary(matured),
         "breakdowns": breakdowns,
         "cohort_start": cohort_dates[0] if cohort_dates else None,
         "cohort_end": cohort_dates[-1] if cohort_dates else None,
