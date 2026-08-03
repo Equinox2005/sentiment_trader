@@ -24,6 +24,12 @@
   padding: 24px 0;
 }
 
+.scorecard-header .header-actions {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
 .back-link {
   color: inherit;
   text-decoration: none;

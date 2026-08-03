@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from bisect import bisect_left
+from collections import defaultdict
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -748,6 +749,65 @@ class PlaybookStore:
             "constituent_count": len(returns),
             "universe_count": int(universe["constituent_count"]),
         }
+
+    def price_ledger_fingerprint(self):
+        """Cheap value that changes whenever cached prices are refreshed.
+
+        The running mark-to-market moves when either the ledger or the prices
+        behind it change, so it needs a second fingerprint alongside
+        `forecast_ledger_fingerprint` to know when a cached report is stale.
+        """
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS symbols,
+                    COALESCE(MAX(last_updated_at), '') AS last_updated,
+                    COALESCE(SUM(generation), 0) AS generations
+                FROM price_cache_meta
+                """
+            ).fetchone()
+        return (
+            int(row["symbols"]),
+            row["last_updated"],
+            int(row["generations"]),
+        )
+
+    def session_bars(self, symbols, start_date):
+        """Daily bars at or after `start_date`, grouped by symbol.
+
+        Returns `{symbol: [(session_date, open, close), ...]}` ascending by
+        session. The mark-to-market walks sessions by position exactly the way
+        `grade_pending_forecasts` does, so it needs the whole forward window
+        per symbol rather than two endpoint lookups.
+        """
+        symbols = [symbol for symbol in dict.fromkeys(symbols) if symbol]
+        if not symbols:
+            return {}
+        bars = defaultdict(list)
+        with self._lock, closing(self._connect()) as connection:
+            for start in range(0, len(symbols), 400):
+                batch = symbols[start : start + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT symbol, session_date, open, close
+                    FROM price_bars
+                    WHERE symbol IN ({placeholders})
+                      AND session_date >= ?
+                    ORDER BY symbol, session_date
+                    """,
+                    (*batch, start_date),
+                ).fetchall()
+                for row in rows:
+                    bars[row["symbol"]].append(
+                        (
+                            row["session_date"],
+                            _optional_float(row["open"]),
+                            _optional_float(row["close"]),
+                        )
+                    )
+        return dict(bars)
 
     def forecast_provenance_for_scan(self, scan_run_id):
         with self._lock, closing(self._connect()) as connection:

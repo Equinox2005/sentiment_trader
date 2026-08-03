@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Playbook's live running return: every open forecast marked to the latest close, with the average so far and the best and worst names.">
+  <title>Playbook — Live returns</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='performance.css') }}">
+</head>
+<body class="performance-page">
+{% macro pct(value) -%}
+  {%- if value is none -%}—{%- else -%}{{ '%+.2f'|format(value) }}%{%- endif -%}
+{%- endmacro %}
+{% macro tone(value) -%}
+  {%- if value is none -%}flat{%- elif value > 0 -%}up{%- elif value < 0 -%}down{%- else -%}flat{%- endif -%}
+{%- endmacro %}
+{% macro board(group) %}
+  <article class="leaderboard">
+    <header class="leaderboard-head">
+      <h2>{{ group.label|capitalize }}</h2>
+      {% if group.total %}
+        <span class="count">
+          {% if group.total > group.rows|length %}
+            Showing {{ group.rows|length }} of {{ group.total }}
+          {% else %}
+            {{ group.total }} name{{ '' if group.total == 1 else 's' }}
+          {% endif %}
+        </span>
+      {% endif %}
+    </header>
+    {% if group.rows %}
+      <div class="leaderboard-scroll">
+        <table>
+          <thead>
+            <tr><th scope="col">#</th><th scope="col">Symbol</th><th scope="col">Entry</th><th scope="col">Mark</th><th scope="col">Held</th><th scope="col">Return</th></tr>
+          </thead>
+          <tbody>
+            {% for row in group.rows %}
+              <tr>
+                <td class="rank">{{ loop.index }}</td>
+                <td class="symbol">{{ row.symbol }}</td>
+                <td>{{ '%.2f'|format(row.entry_price) if row.entry_price is not none else '—' }}</td>
+                <td>{{ '%.2f'|format(row.mark_price) if row.mark_price is not none else '—' }}</td>
+                <td class="held">{{ row.sessions_elapsed }}/{{ row.horizon_days }}</td>
+                <td class="return {{ tone(row.signed_return) }}">{{ pct(row.signed_return) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">
+        {% if group.winners %}
+          No {{ group.side }} forecast is in profit yet.
+        {% else %}
+          No {{ group.side }} forecast is down.
+        {% endif %}
+      </p>
+    {% endif %}
+  </article>
+{% endmacro %}
+
+  <header class="performance-header">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">⟳</span>
+      <span>Playbook</span>
+    </a>
+    <nav class="header-actions">
+      <a class="back-link" href="/">Signal board</a>
+      <a class="back-link" href="/scorecard">Forecast scorecard</a>
+    </nav>
+  </header>
+
+  <main class="performance-shell">
+    <section class="performance-hero">
+      <span class="eyebrow">Live running return</span>
+      <h1>How the open forecasts are doing right now.</h1>
+      <p>
+        Every forecast in the ledger is bought at the next session's open and marked to the most recent close,
+        the same way the scorecard settles it at the end of the horizon. This page updates as each trading day's
+        prices arrive, so the average moves daily instead of staying blank until the window closes.
+      </p>
+    </section>
+
+    {% if not report %}
+      <section class="headline-card">
+        <div class="headline-copy">
+          <h2>Live return tracking is unavailable</h2>
+          <p>Persistent forecast storage is not configured for this deployment.</p>
+        </div>
+      </section>
+    {% else %}
+      {% set metrics = report.headline.metrics %}
+      <section class="headline-card">
+        <div class="headline-copy">
+          <span class="eyebrow">Average return per forecast, so far</span>
+          {% if report.headline.available %}
+            <h2 class="headline-number {{ tone(metrics.average_return) }}" id="averageReturn">{{ pct(metrics.average_return) }}</h2>
+            <p>
+              Across <strong>{{ metrics.sample_size }}</strong> directional forecasts held since
+              <strong>{{ report.cohort_start }}</strong>, marked to the close of
+              <strong>{{ report.evaluation_session }}</strong>.
+              {% if metrics.average_benchmark_return is not none %}
+                Holding every tracked symbol over the identical window returned
+                <strong>{{ pct(metrics.average_benchmark_return) }}</strong>, a difference of
+                <strong class="{{ tone(metrics.average_excess_return) }}">{{ pct(metrics.average_excess_return) }}</strong>.
+              {% endif %}
+            </p>
+            <dl class="metric-list">
+              <div><dt>Median</dt><dd class="{{ tone(metrics.median_return) }}">{{ pct(metrics.median_return) }}</dd></div>
+              <div><dt>Winners</dt><dd>{{ '%.1f'|format(metrics.positive_share) }}% of {{ metrics.sample_size }}</dd></div>
+              <div><dt>Best / worst</dt><dd><span class="up">{{ pct(metrics.best_return) }}</span> / <span class="down">{{ pct(metrics.worst_return) }}</span></dd></div>
+              <div><dt>Dispersion</dt><dd>{{ '%.2f'|format(metrics.standard_deviation) }}%</dd></div>
+            </dl>
+          {% else %}
+            <h2 class="headline-number flat">Not started yet</h2>
+            <p class="suppression-note">{{ report.headline.reason }}</p>
+          {% endif %}
+
+          {% if report.progress.sessions_total %}
+            <div class="progress" role="group" aria-label="Holding window progress">
+              <div class="progress-track">
+                <div class="progress-fill" style="width: {{ report.progress.percent_complete }}%"></div>
+              </div>
+              <span>Session {{ report.progress.sessions_elapsed }} of {{ report.progress.sessions_total }}</span>
+            </div>
+          {% endif %}
+        </div>
+
+        <aside class="limitations" aria-label="What this number is">
+          <strong>What this number is—and is not</strong>
+          <p>{{ report.limitations }}</p>
+          <p>Open positions are marked at an unrealised price and can still move. Nothing here is a claim of profit.</p>
+        </aside>
+      </section>
+
+      <section class="accounting-grid" aria-label="Forecast accounting">
+        <article><span>Marked</span><strong>{{ report.counts.scored }}</strong><small>directional, in the average</small></article>
+        <article><span>Awaiting entry</span><strong>{{ report.counts.awaiting_entry }}</strong><small>next session's open</small></article>
+        <article><span>No directional call</span><strong>{{ report.counts.neutral }}</strong><small>excluded from the average</small></article>
+        <article><span>Withheld</span><strong>{{ report.counts.suspect }}</strong><small>suspected split or data break</small></article>
+      </section>
+
+      {% if report.sides %}
+        <section class="side-grid" aria-label="Return by side">
+          {% for side in report.sides %}
+            <article>
+              <h3>{{ side.label|capitalize }}</h3>
+              <strong class="{{ tone(side.average_return) }}">{{ pct(side.average_return) }}</strong>
+              <p>{{ side.sample_size }} forecasts · {{ '%.1f'|format(side.positive_share) }}% positive</p>
+            </article>
+          {% endfor %}
+        </section>
+      {% endif %}
+
+      {% if report.counts.scored %}
+        <section class="leaderboards">
+          {% for group in report.leaderboards %}
+            {{ board(group) }}
+          {% endfor %}
+        </section>
+      {% endif %}
+
+      {% if report.withheld %}
+        <section class="withheld-section">
+          <h2>Withheld from the average</h2>
+          <p>
+            These names moved further in a single session than a real price move plausibly can, which is the
+            signature of a reverse split that the cached history has not been adjusted for. They are excluded
+            rather than allowed to distort the average.
+          </p>
+          <ul class="withheld-list">
+            {% for item in report.withheld %}
+              <li><span>{{ item.symbol }}</span><strong>{{ pct(item.price_return) }} raw</strong></li>
+            {% endfor %}
+          </ul>
+        </section>
+      {% endif %}
+    {% endif %}
+  </main>
+</body>
+</html>

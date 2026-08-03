@@ -103,6 +103,168 @@ class StubScorecard:
         }
 
 
+class StubPerformance:
+    def __init__(self, available=True):
+        self.available = available
+
+    def current(self):
+        return {
+            "evaluation_date": "2026-08-14",
+            "evaluation_session": "2026-08-13",
+            "counts": {
+                "total": 2801,
+                "scored": 1690 if self.available else 0,
+                "neutral": 1107,
+                "awaiting_entry": 0 if self.available else 2801,
+                "unpriced": 0,
+                "suspect": 4,
+                "matured": 0,
+                "open": 1690 if self.available else 0,
+            },
+            "headline": {
+                "available": self.available,
+                "reason": (
+                    None
+                    if self.available
+                    else (
+                        "No forecast has a tradable entry yet. The first mark "
+                        "appears after the next session opens."
+                    )
+                ),
+                "metrics": (
+                    {
+                        "sample_size": 1690,
+                        "average_return": 2.4137,
+                        "median_return": 1.8,
+                        "standard_deviation": 9.12,
+                        "positive_share": 56.4,
+                        "best_return": 41.2,
+                        "worst_return": -28.9,
+                        "benchmark_sample_size": 1690,
+                        "average_benchmark_return": 0.91,
+                        "average_excess_return": 1.5037,
+                    }
+                    if self.available
+                    else None
+                ),
+            },
+            "progress": {
+                "sessions_elapsed": 9,
+                "sessions_total": 21,
+                "percent_complete": 42.8571,
+            },
+            "sides": (
+                [
+                    {
+                        "label": "long",
+                        "sample_size": 940,
+                        "average_return": 3.1,
+                        "positive_share": 59.0,
+                    }
+                ]
+                if self.available
+                else []
+            ),
+            "leaderboards": [
+                {
+                    "key": "long_winners",
+                    "label": "Top long returns",
+                    "side": "long",
+                    "winners": True,
+                    "total": 312,
+                    "rows": (
+                        [
+                            {
+                                "symbol": "AAA",
+                                "side": "long",
+                                "tier": "strong",
+                                "state": "open",
+                                "entry_date": "2026-08-03",
+                                "entry_price": 10.0,
+                                "mark_date": "2026-08-13",
+                                "mark_price": 14.12,
+                                "sessions_elapsed": 9,
+                                "horizon_days": 21,
+                                "price_return": 41.2,
+                                "signed_return": 41.2,
+                            }
+                        ]
+                        if self.available
+                        else []
+                    ),
+                },
+                {
+                    "key": "short_winners",
+                    "label": "Top short returns",
+                    "side": "short",
+                    "winners": True,
+                    "total": 0,
+                    "rows": [],
+                },
+                {
+                    "key": "long_losers",
+                    "label": "Worst long returns",
+                    "side": "long",
+                    "winners": False,
+                    "total": 0,
+                    "rows": [],
+                },
+                {
+                    "key": "short_losers",
+                    "label": "Worst short returns",
+                    "side": "short",
+                    "winners": False,
+                    "total": 1,
+                    "rows": (
+                        [
+                            {
+                                "symbol": "ZZZ",
+                                "side": "short",
+                                "tier": "moderate",
+                                "state": "open",
+                                "entry_date": "2026-08-03",
+                                "entry_price": 20.0,
+                                "mark_date": "2026-08-13",
+                                "mark_price": 25.78,
+                                "sessions_elapsed": 9,
+                                "horizon_days": 21,
+                                "price_return": 28.9,
+                                "signed_return": -28.9,
+                            }
+                        ]
+                        if self.available
+                        else []
+                    ),
+                },
+            ],
+            "withheld": [
+                {
+                    "symbol": "SPLT",
+                    "side": "long",
+                    "tier": "speculative",
+                    "state": "suspect",
+                    "entry_date": "2026-08-03",
+                    "entry_price": 0.5,
+                    "mark_date": "2026-08-13",
+                    "mark_price": 20.0,
+                    "sessions_elapsed": 9,
+                    "horizon_days": 21,
+                    "price_return": 3900.0,
+                    "signed_return": None,
+                }
+            ],
+            "neutral_sample": 1107,
+            "cohort_start": "2026-07-31",
+            "cohort_end": "2026-07-31",
+            "limitations": (
+                "This is the average price move per forecast, equally weighted "
+                "and marked to the latest close. It is not a portfolio return: "
+                "it excludes trading costs, position sizing, capital limits, "
+                "and the overlap between forecasts issued on the same day."
+            ),
+        }
+
+
 class AppTests(unittest.TestCase):
     def setUp(self):
         app = create_app(StubService(), board_service=StubBoard())
@@ -271,6 +433,103 @@ class AppTests(unittest.TestCase):
             page.data,
         )
         self.assertNotIn(b'id="headlineMean"', page.data)
+
+    def test_live_return_page_publishes_the_running_average_and_leaderboards(self):
+        app = create_app(
+            StubService(),
+            board_service=StubBoard(),
+            scorecard_service=StubScorecard(),
+            performance_service=StubPerformance(),
+        )
+        app.config.update(TESTING=True, SCAN_TOKEN="")
+        client = app.test_client()
+
+        page = client.get("/performance")
+        api = client.get("/api/performance")
+
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(api.status_code, 200)
+        self.assertEqual(api.headers["Cache-Control"], "no-store")
+        self.assertAlmostEqual(
+            api.get_json()["headline"]["metrics"]["average_return"],
+            2.4137,
+        )
+        self.assertIn(b"+2.41%", page.data)
+        self.assertIn(b"Session 9 of 21", page.data)
+        self.assertIn(b"Top long returns", page.data)
+        self.assertIn(b"Top short returns", page.data)
+        self.assertIn(b"Worst long returns", page.data)
+        self.assertIn(b"Worst short returns", page.data)
+        self.assertIn(b"AAA", page.data)
+        self.assertIn(b"ZZZ", page.data)
+        self.assertIn(b"-28.90%", page.data)
+        self.assertIn(b"not a portfolio return", page.data)
+        # The full population is stated whenever the table is truncated.
+        self.assertIn(b"Showing 1 of 312", page.data)
+        self.assertIn(b"No short forecast is in profit yet.", page.data)
+
+    def test_live_return_page_is_honest_before_the_first_entry(self):
+        app = create_app(
+            StubService(),
+            board_service=StubBoard(),
+            scorecard_service=StubScorecard(),
+            performance_service=StubPerformance(available=False),
+        )
+        app.config.update(TESTING=True, SCAN_TOKEN="")
+        client = app.test_client()
+
+        page = client.get("/performance")
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b"Not started yet", page.data)
+        self.assertIn(b"after the next session opens", page.data)
+        self.assertNotIn(b'id="averageReturn"', page.data)
+
+    def test_live_return_page_reports_withheld_split_artifacts(self):
+        app = create_app(
+            StubService(),
+            board_service=StubBoard(),
+            scorecard_service=StubScorecard(),
+            performance_service=StubPerformance(),
+        )
+        app.config.update(TESTING=True, SCAN_TOKEN="")
+
+        page = app.test_client().get("/performance")
+
+        self.assertIn(b"Withheld from the average", page.data)
+        self.assertIn(b"SPLT", page.data)
+        self.assertIn(b"reverse split", page.data)
+
+    def test_live_return_endpoints_report_missing_storage(self):
+        app = create_app(StubService(), board_service=StubBoard())
+        app.config.update(TESTING=True, SCAN_TOKEN="")
+        client = app.test_client()
+
+        page = client.get("/performance")
+        api = client.get("/api/performance")
+
+        self.assertEqual(page.status_code, 503)
+        self.assertEqual(api.status_code, 503)
+        self.assertEqual(api.get_json()["code"], "no_storage")
+
+    def test_live_return_computation_is_rate_limited(self):
+        app = create_app(
+            StubService(),
+            board_service=StubBoard(),
+            performance_service=StubPerformance(),
+        )
+        app.config.update(
+            TESTING=True,
+            ANALYSIS_RATE_LIMIT=1,
+            RATE_LIMIT_WINDOW_SECONDS=60,
+        )
+        client = app.test_client()
+
+        first = client.get("/api/performance")
+        limited = client.get("/performance")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(limited.status_code, 429)
 
     def test_favicon_asset_is_available(self):
         with self.client.get("/static/favicon.svg") as response:
