@@ -84,7 +84,40 @@ def build_date_grid(connection):
     sessions = [d for d in spy.index if d >= pd.Timestamp(START_DATE)]
     # Only sessions whose full 21-session forward window exists in SPY.
     usable = sessions[: max(0, len(sessions) - HORIZON)]
-    return usable[::STEP]
+    grid = usable[::STEP]
+
+    # BT_CONSECUTIVE=anchor:length,... expands each anchor into consecutive
+    # sessions. The default grid is 21 sessions apart, so it cannot say how much
+    # the board changes from one day to the next; this can.
+    runs = os.environ.get("BT_CONSECUTIVE", "").strip()
+    if runs:
+        positions = {d: i for i, d in enumerate(usable)}
+        chosen = []
+        for chunk in runs.split(","):
+            anchor, _, length = chunk.partition(":")
+            start = pd.Timestamp(anchor.strip())
+            index = next(
+                (i for d, i in positions.items() if d >= start), None
+            )
+            if index is None:
+                continue
+            span = int(length or 5)
+            chosen.extend(usable[index : index + span])
+        return sorted(set(chosen))
+
+    # The default grid is one of 21 possible phases. BT_RANDOM_DATES samples
+    # sessions that are deliberately *not* on it, which is the only way to tell
+    # whether a result is a property of the strategy or of the chosen phase.
+    sample = int(os.environ.get("BT_RANDOM_DATES", "0"))
+    if sample <= 0:
+        return grid
+
+    on_grid = set(grid)
+    # Keep a horizon's clearance from the ends so every draw has a full window.
+    candidates = [d for d in usable[HORIZON:] if d not in on_grid]
+    rng = random.Random(SEED + 7)
+    chosen = rng.sample(candidates, min(sample, len(candidates)))
+    return sorted(chosen)
 
 
 def choose_universe(connection):
